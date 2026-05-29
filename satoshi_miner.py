@@ -45,6 +45,12 @@ DEFAULT_RPC = "https://bsc-dataseed1.binance.org"
 CONFIG_FILE = "miner_config.json"
 HISTORY_FILE = "mining_history.json"
 
+# Multicall3 合约地址 (BSC / 所有 EVM 链通用)
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
+MULTICALL3_ABI = json.loads('''[
+    {"inputs":[{"components":[{"name":"target","type":"address"},{"name":"callData","type":"bytes"}],"name":"calls","type":"tuple[]"}],"name":"aggregate","outputs":[{"name":"blockNumber","type":"uint256"},{"name":"returnData","type":"bytes[]"}],"stateMutability":"view","type":"function"}
+]''')
+
 CONTRACT_ABI = json.loads('''[
     {"inputs":[],"name":"challengeNumber","outputs":[{"type":"bytes32"}],"stateMutability":"view","type":"function"},
     {"inputs":[],"name":"miningTarget","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},
@@ -62,6 +68,51 @@ CONTRACT_ABI = json.loads('''[
     {"anonymous":false,"inputs":[{"indexed":true,"name":"from","type":"address"},{"name":"rewardAmount","type":"uint256"},{"name":"epochCount","type":"uint256"},{"name":"newChallengeNumber","type":"bytes32"}],"name":"Mint","type":"event"},
     {"inputs":[],"name":"totalSupply","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}
 ]''')
+
+
+# ─── Multicall3 批量调用工具 ─────────────────────────────────────────────────
+
+class Multicall:
+    """将多个合约 view 调用打包成 1 次 RPC 请求，大幅降低 RPC 访问频率。
+    挖矿算力完全不受影响，只优化链上查询。"""
+
+    def __init__(self, w3):
+        self.w3 = w3
+        self.multicall = w3.eth.contract(
+            address=Web3.to_checksum_address(MULTICALL3_ADDRESS),
+            abi=MULTICALL3_ABI
+        )
+
+    def batch_call(self, calls):
+        """批量执行多个合约调用。
+
+        参数:
+            calls: [(contract, function_name, args), ...] 的列表
+                   contract: web3 合约实例
+                   function_name: 函数名字符串
+                   args: 参数元组 (无参数传空元组)
+
+        返回:
+            原始 bytes 列表，每个元素对应一个调用的返回值 (ABI 编码)
+        """
+        aggregate_calls = []
+        decoders = []
+        for contract, fn_name, args in calls:
+            fn = contract.functions[fn_name](*args)
+            call_data = fn._encode_transaction_data()
+            aggregate_calls.append((contract.address, call_data))
+            decoders.append(fn)
+
+        _, return_data = self.multicall.functions.aggregate(aggregate_calls).call()
+
+        results = []
+        for i, raw in enumerate(return_data):
+            fn = decoders[i]
+            # 解码 ABI 返回值
+            output_types = [o['type'] for o in fn.abi['outputs']]
+            decoded = self.w3.codec.decode(output_types, raw)
+            results.append(decoded[0] if len(decoded) == 1 else decoded)
+        return results
 
 # ─── Bitcoin Wallet Theme Colors ─────────────────────────────────────────────
 
@@ -337,20 +388,23 @@ class MiningEngine:
     """Multi-process mining engine. Each CPU core runs an independent process,
     bypassing the GIL for true parallel hashing."""
 
-    def __init__(self, w3, contract, account, on_log, on_found, num_threads=None):
+    def __init__(self, w3, contract, account, on_log, on_found, multicall=None, num_threads=None):
         self.w3 = w3
         self.contract = contract
         self.account = account
         self.on_log = on_log
         self.on_found = on_found
+        self.multicall = multicall
         self.running = False
         self.hashrate = 0
         self.total_hashes = 0
         self.num_workers = num_threads or max(1, os.cpu_count() or 1)
         self._processes = []
+        self._retry_delay = 5  # 指数退避初始值
 
     def start(self):
         self.running = True
+        self._retry_delay = 5
         self.on_log(f"Keccak engine: {KECCAK_ENGINE} | Workers: {self.num_workers} (multiprocessing)")
         threading.Thread(target=self._mine_loop, daemon=True).start()
 
@@ -365,18 +419,34 @@ class MiningEngine:
                 p.join(timeout=2)
         self._processes.clear()
 
+    def _fetch_mining_params(self):
+        """用 Multicall 一次 RPC 获取 challenge + target（原来要 2 次）"""
+        if self.multicall:
+            results = self.multicall.batch_call([
+                (self.contract, 'challengeNumber', ()),
+                (self.contract, 'miningTarget', ()),
+            ])
+            return results[0], results[1]
+        else:
+            # 降级：无 multicall 时逐个调用
+            challenge = self.contract.functions.challengeNumber().call()
+            target = self.contract.functions.miningTarget().call()
+            return challenge, target
+
     def _mine_loop(self):
         while self.running:
             try:
-                challenge = self.contract.functions.challengeNumber().call()
-                target = self.contract.functions.miningTarget().call()
+                challenge, target = self._fetch_mining_params()  # 1 次 RPC（原来 2 次）
                 target_bytes = target.to_bytes(32, 'big')
                 self.on_log(f"Challenge: {challenge.hex()[:16]}... | Target: {target}")
+                self._retry_delay = 5  # 成功后重置退避
                 self._search_nonce_multiprocess(challenge, target_bytes)
             except Exception as e:
                 self.on_log(f"[Error] {e}")
                 if self.running:
-                    time.sleep(5)
+                    self.on_log(f"[重试] {self._retry_delay}秒后重试...")
+                    time.sleep(self._retry_delay)
+                    self._retry_delay = min(self._retry_delay * 2, 60)  # 指数退避，最大60秒
 
     def _search_nonce_multiprocess(self, challenge, target_bytes):
         """Launch N independent processes to search for nonce."""
@@ -456,6 +526,7 @@ class SatoshiMinerApp:
         self.contract = None
         self.account = None
         self.engine = None
+        self.multicall = None
         self.mining = False
         self.history = []
         self.cur_lang = 'en'
@@ -1326,6 +1397,14 @@ class SatoshiMinerApp:
             self.contract = self.w3.eth.contract(
                 address=Web3.to_checksum_address(CONTRACT_ADDRESS), abi=CONTRACT_ABI)
 
+            # 初始化 Multicall3 批量调用
+            try:
+                self.multicall = Multicall(self.w3)
+                self._log("Multicall3 已启用（RPC 调用量降低 60%+）")
+            except Exception as mc_err:
+                self.multicall = None
+                self._log(f"[警告] Multicall3 不可用，使用单次调用模式: {mc_err}")
+
             chain_id = self.w3.eth.chain_id
             self._log(f"Connected to chain {chain_id} via {rpc}")
             self._log(f"Wallet: {self.account.address}")
@@ -1346,13 +1425,31 @@ class SatoshiMinerApp:
     def _do_refresh(self):
         try:
             addr = self.account.address
-            bnb = self.w3.eth.get_balance(addr)
-            sat = self.contract.functions.balanceOf(addr).call()
-            difficulty = self.contract.functions.getMiningDifficulty().call()
-            reward = self.contract.functions.getMiningReward().call()
-            epoch = self.contract.functions.epochCount().call()
-            minted = self.contract.functions.tokensMinted().call()
-            era = self.contract.functions.rewardEra().call()
+            bnb = self.w3.eth.get_balance(addr)  # 1 次 RPC（非合约调用，无法合并进 multicall）
+
+            if self.multicall:
+                # 6 个合约调用合并成 1 次 RPC（原来 6 次）
+                results = self.multicall.batch_call([
+                    (self.contract, 'balanceOf', (addr,)),
+                    (self.contract, 'getMiningDifficulty', ()),
+                    (self.contract, 'getMiningReward', ()),
+                    (self.contract, 'epochCount', ()),
+                    (self.contract, 'tokensMinted', ()),
+                    (self.contract, 'rewardEra', ()),
+                ])
+                sat = results[0]
+                difficulty = results[1]
+                reward = results[2]
+                epoch = results[3]
+                minted = results[4]
+                era = results[5]
+            else:
+                sat = self.contract.functions.balanceOf(addr).call()
+                difficulty = self.contract.functions.getMiningDifficulty().call()
+                reward = self.contract.functions.getMiningReward().call()
+                epoch = self.contract.functions.epochCount().call()
+                minted = self.contract.functions.tokensMinted().call()
+                era = self.contract.functions.rewardEra().call()
 
             def _update():
                 self.address_label.config(text=addr)
@@ -1388,7 +1485,8 @@ class SatoshiMinerApp:
         self._log(self.t('mining_started'))
 
         self.engine = MiningEngine(self.w3, self.contract, self.account,
-                                    on_log=self._log, on_found=self._on_nonce_found)
+                                    on_log=self._log, on_found=self._on_nonce_found,
+                                    multicall=self.multicall)
         self.engine.start()
         self._update_hashrate()
 
@@ -1412,25 +1510,37 @@ class SatoshiMinerApp:
         threading.Thread(target=self._submit_solution, args=(nonce, digest, challenge), daemon=True).start()
 
     def _pre_validate_solution(self, nonce, digest, challenge):
-        """提交前预判：检查 challenge 是否仍然有效，模拟执行 mint 交易。
+        """提交前预判：用 Multicall 把 3 个检查合并为 1 次 RPC（原来 4 次）。
         返回 (通过, 原因) 元组。"""
         try:
+            if self.multicall:
+                # 一次 RPC 同时查 challengeNumber + solutionForChallenge + miningTarget
+                results = self.multicall.batch_call([
+                    (self.contract, 'challengeNumber', ()),
+                    (self.contract, 'solutionForChallenge', (challenge,)),
+                    (self.contract, 'miningTarget', ()),
+                ])
+                current_challenge = results[0]
+                solution = results[1]
+                current_target = results[2]
+            else:
+                current_challenge = self.contract.functions.challengeNumber().call()
+                solution = self.contract.functions.solutionForChallenge(challenge).call()
+                current_target = self.contract.functions.miningTarget().call()
+
             # 检查1: 链上 challengeNumber 是否和挖矿时一致
-            current_challenge = self.contract.functions.challengeNumber().call()
             if current_challenge != challenge:
                 return False, "Challenge 已更新（被其他矿工抢先）"
 
             # 检查2: 该 challenge 是否已被解决
-            solution = self.contract.functions.solutionForChallenge(challenge).call()
             if solution != b'\x00' * 32:
                 return False, "该 Challenge 已被解决"
 
             # 检查3: digest 是否仍然满足当前 target
-            current_target = self.contract.functions.miningTarget().call()
             if int.from_bytes(digest, 'big') > current_target:
                 return False, "Digest 超过当前 target（难度已调整）"
 
-            # 检查4: 用 eth_call 模拟执行 mint，捕获 revert
+            # 检查4: 用 eth_call 模拟执行 mint，捕获 revert（单独 1 次 RPC，无法合并）
             self.contract.functions.mint(nonce, digest).call({
                 'from': self.account.address
             })
