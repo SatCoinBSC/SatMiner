@@ -898,6 +898,10 @@ class SatoshiMinerApp:
         if hasattr(self, 'panels') and name in self.panels:
             self.panels[name].pack(fill='both', expand=True)
 
+        # 切换到记录页面时，重新刷新历史列表
+        if name == 'history':
+            self._populate_history()
+
     def _build_panels(self):
         self.panels = {}
         self._build_wallet_panel()
@@ -1251,8 +1255,11 @@ class SatoshiMinerApp:
             for c in children:
                 if isinstance(c, tk.Label):
                     c.destroy()
-            row.pack(fill='x', pady=1, before=self.history_list_frame.winfo_children()[0]
-                     if self.history_list_frame.winfo_children() else None)
+            existing = self.history_list_frame.winfo_children()
+            if existing:
+                row.pack(fill='x', pady=1, before=existing[0])
+            else:
+                row.pack(fill='x', pady=1)
         else:
             row.pack(fill='x', pady=1)
 
@@ -1568,6 +1575,9 @@ class SatoshiMinerApp:
                                     on_log=self._log, on_found=self._on_nonce_found,
                                     multicall=self.multicall)
         self.engine.start()
+        # 从历史记录恢复已出块计数
+        blocks = len([h for h in self.history if h.get('status') == 'Success'])
+        self.blocks_label.config(text=str(blocks))
         self._update_hashrate()
 
     def _stop_mining(self):
@@ -1698,6 +1708,7 @@ class SatoshiMinerApp:
             }
             self.history.append(entry)
             self._save_history()
+            self.root.after(0, lambda: self._add_history_row(entry))
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
