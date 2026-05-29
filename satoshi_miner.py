@@ -38,10 +38,18 @@ try:
 except ImportError:
     HAS_PIL = False
 
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 CONTRACT_ADDRESS = "0x14Dc4b4929c664534f1d4D64107d8F36CbF906a0"
-DEFAULT_RPC = "https://bsc-dataseed1.binance.org"
+DEFAULT_RPC = "https://bsc-dataseed.bnbchain.org"
 CONFIG_FILE = "miner_config.json"
 HISTORY_FILE = "mining_history.json"
 
@@ -69,6 +77,66 @@ CONTRACT_ABI = json.loads('''[
     {"inputs":[],"name":"totalSupply","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}
 ]''')
 
+
+# ─── RPC 限速器 ──────────────────────────────────────────────────────────────
+
+class RPCRateLimiter:
+    """限制 RPC 调用频率，防止被节点封禁。
+    默认最多每秒 5 次请求（BSC 公共节点限制通常为 10 req/s）。
+    挖矿算力完全不受影响——挖矿是纯 CPU 运算，不走 RPC。"""
+
+    def __init__(self, max_calls_per_second=5):
+        self._min_interval = 1.0 / max_calls_per_second
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_call
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
+            self._last_call = time.monotonic()
+
+
+def create_optimized_provider(rpc_url, rate_limiter=None):
+    """创建带连接池复用 + 限速的 Web3 HTTPProvider。
+    - 连接池复用避免每次 RPC 都重新握手 TLS（减少约 100ms/请求）
+    - 限速保护防止被公共节点 ban IP"""
+    if HAS_REQUESTS:
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=1,
+            pool_maxsize=5,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        # 注入限速到 session 的 post 方法
+        if rate_limiter:
+            original_post = session.post
+            def rate_limited_post(*args, **kwargs):
+                rate_limiter.wait()
+                return original_post(*args, **kwargs)
+            session.post = rate_limited_post
+
+        provider = Web3.HTTPProvider(rpc_url, session=session)
+    else:
+        provider = Web3.HTTPProvider(rpc_url)
+
+    # 增大请求超时，避免偶尔慢响应导致异常
+    provider.request_kwargs = {'timeout': 30}
+    return provider
+
+
+# 全局限速器实例
+_rpc_rate_limiter = RPCRateLimiter(max_calls_per_second=5)
 
 # ─── Multicall3 批量调用工具 ─────────────────────────────────────────────────
 
@@ -441,6 +509,9 @@ class MiningEngine:
                 self.on_log(f"Challenge: {challenge.hex()[:16]}... | Target: {target}")
                 self._retry_delay = 5  # 成功后重置退避
                 self._search_nonce_multiprocess(challenge, target_bytes)
+                # 找到 nonce 后短暂等待，让链上状态更新后再拉取新 challenge
+                if self.running:
+                    time.sleep(2.0)
             except Exception as e:
                 self.on_log(f"[Error] {e}")
                 if self.running:
@@ -472,12 +543,16 @@ class MiningEngine:
             p.start()
 
         # Monitor loop: poll shared memory for hashrate updates & result
+        _last_log_time = time.monotonic()
         while self.running and not stop_flag.value:
             time.sleep(1.0)
             self.hashrate = sum(hashrate_array)
             self.total_hashes = sum(total_hashes_array)
-            if self.hashrate > 0:
+            now = time.monotonic()
+            # 每 5 秒才打印一次日志，减少 UI 刷新开销
+            if self.hashrate > 0 and (now - _last_log_time) >= 5.0:
                 self.on_log(f"Hashrate: {self.hashrate:.0f} H/s | Total: {self.total_hashes:,}")
+                _last_log_time = now
 
         if not self.running:
             stop_flag.value = 1
@@ -752,7 +827,7 @@ class SatoshiMinerApp:
                                    command=self._toggle_lang)
         self.lang_btn.pack(side='left')
 
-        version_lbl = tk.Label(bottom_frame, text='v2.0.0', font=('Segoe UI', 8),
+        version_lbl = tk.Label(bottom_frame, text='v2.1.0', font=('Segoe UI', 8),
                                 fg=COLORS['text3'], bg=COLORS['bg_card'])
         version_lbl.pack(side='right')
 
@@ -1389,7 +1464,7 @@ class SatoshiMinerApp:
             return
 
         try:
-            self.w3 = Web3(Web3.HTTPProvider(rpc))
+            self.w3 = Web3(create_optimized_provider(rpc, _rpc_rate_limiter))
             if not self.w3.is_connected():
                 raise Exception("Cannot connect to RPC")
 
@@ -1420,6 +1495,11 @@ class SatoshiMinerApp:
     def _refresh_info(self):
         if not self.w3 or not self.account:
             return
+        # 防抖：至少 5 秒刷新一次，避免频繁调用 RPC
+        now = time.monotonic()
+        if hasattr(self, '_last_refresh_time') and (now - self._last_refresh_time) < 5.0:
+            return
+        self._last_refresh_time = now
         threading.Thread(target=self._do_refresh, daemon=True).start()
 
     def _do_refresh(self):
