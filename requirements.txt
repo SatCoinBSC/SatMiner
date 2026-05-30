@@ -3,3 +3,6 @@ eth-account>=0.10.0
 Pillow>=10.0.0
 pycryptodome>=3.19.0
 pyinstaller>=6.0.0
+requests>=2.28.0
+setuptools>=65.0.0
+pyyaml>=6.0
