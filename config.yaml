@@ -1,0 +1,48 @@
+# ============================================================
+# SAT 反应式矿机 — Windows + NVIDIA RTX 3070 专用配置
+# (fast_miner.py 读取本文件; 与 Mac 根目录的 config.yaml 互不影响)
+# ============================================================
+
+# 钱包私钥 (64位, 0x 开头). 在 Windows 这台机器上填你自己的私钥, 钱包里要有少量 BNB 付 gas.
+private_key: "YOUR_PRIVATE_KEY_HERE"
+# 多钱包轮换可改用列表 (fast_miner 取第一个):
+# private_keys: ["YOUR_KEY_1","YOUR_KEY_2"]
+
+# SAT 合约 / BSC 主网
+contract_address: "0x14Dc4b4929c664534f1d4D64107d8F36CbF906a0"
+chain_id: 56
+
+# --- Gas: 跟网络地板价, 不加价 (和对手一致, 省钱) ---
+use_network_gas: true
+network_gas_multiplier: 1.0
+min_gas_price_gwei: 0.01
+max_gas_price_gwei: 5
+gas_price_gwei: 0.05
+gas_limit: 200000
+
+# --- 求解器 (RTX 3070) ---
+solver: gpu
+# 按设备名子串选卡; 有核显+独显时填 "NVIDIA" 或 "3070" 避免选错. 单卡可留空自动选.
+gpu_device: "NVIDIA"
+# GPU 占用率(%): 100=全速(出解最快, 推荐桌面独显竞速) | 40~50=温控省电但出解慢、抢得少.
+gpu_util: 100
+# 每批扫描 nonce 数. RTX 3070 ~1-3 GH/s, 16M 一批约 5-15ms. 太大→响应慢(过期解多); 太小→吞吐低.
+# 看 verbose/试运行里的"出解 ms"调; 3070 建议 8000000~32000000.
+gpu_batch_size: 16000000
+
+# --- 提交: 同一签名交易并行广播到直投验证者 relay (mempool去重, 不多花 gas) ---
+relay_urls:
+  - "https://bsc.rpc.blxrbdn.com"
+  - "https://rpc-bsc.48.club"
+  - "https://0.48.club"
+
+# --- 检测挑战号: WS 订阅 Mint 事件 (零RPC). 免费 logs-WS 易限流, auto 会自动退到稳定 heads ---
+ws_urls:
+  - "wss://bsc.drpc.org"
+detect_mode: auto          # auto | logs | heads
+head_ws: "wss://bsc-rpc.publicnode.com"
+
+# 试运行: 只算解+计时不广播不花 gas (先看出解 ms). 也可用环境变量 DRY_RUN=1
+dry_run: false
+# 日志: false=只报自己的成功/失败 (推荐); true=打印发出/统计/WS等全部细节
+verbose_logs: false

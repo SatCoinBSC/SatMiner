@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Satoshi (SAT) Token Miner - BSC PoW Mining Client
-A desktop GUI mining application for the Satoshi ERC20 PoW token on BSC.
-Bitcoin wallet-style dark UI with CN/EN language switching.
+Satoshi (SAT) Token Miner v3.0 — 反应式挖矿 + GUI
+整合测试安装包的全部挖矿规则:
+  - WebSocket 订阅 Mint 事件 (零轮询检测新挑战号)
+  - GPU OpenCL 求解器 (高难度时自动启用)
+  - CPU 常驻热池 (多进程, 零冷启动)
+  - 多 relay 并行广播 (bloXroute / 48 Club)
+  - Gas 跟网络地板价, 不加价
+  - 自动 detect 模式 (logs -> heads 退化)
+  - 试运行 (DRY_RUN) 支持
 """
 
 import tkinter as tk
@@ -18,6 +24,8 @@ import sys
 import random
 import base64
 import io
+import signal
+import asyncio
 from datetime import datetime
 
 # Third-party imports
@@ -33,10 +41,21 @@ except ImportError:
     from eth_account import Account
 
 try:
-    from PIL import Image, ImageTk, ImageDraw
-    HAS_PIL = True
+    from web3.middleware import ExtraDataToPOAMiddleware as _POA
+except Exception:
+    from web3.middleware import geth_poa_middleware as _POA
+
+try:
+    import yaml
+    HAS_YAML = True
 except ImportError:
-    HAS_PIL = False
+    HAS_YAML = False
+
+try:
+    import websockets
+    HAS_WS = True
+except ImportError:
+    HAS_WS = False
 
 try:
     import requests
@@ -46,8 +65,22 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-# ★ C 扩展加速：keccak_pow 提供纯 C 实现的 keccak-256 批量搜索，速度提升 5-10 倍
-# 编译方法：python setup.py build_ext --inplace
+try:
+    from PIL import Image, ImageTk, ImageDraw
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+try:
+    from Crypto.Hash import keccak as _pycryptodome_keccak
+    def _fast_keccak256(data):
+        return _pycryptodome_keccak.new(digest_bits=256, data=data).digest()
+    KECCAK_ENGINE = "pycryptodome"
+except ImportError:
+    def _fast_keccak256(data):
+        return bytes(Web3.keccak(data))
+    KECCAK_ENGINE = "web3 (slow)"
+
 try:
     import keccak_pow
     HAS_C_EXT = True
@@ -60,22 +93,13 @@ CONTRACT_ADDRESS = "0x14Dc4b4929c664534f1d4D64107d8F36CbF906a0"
 DEFAULT_RPC = "https://bsc-dataseed.bnbchain.org"
 CONFIG_FILE = "miner_config.json"
 HISTORY_FILE = "mining_history.json"
-SOLVED_CACHE_FILE = "solved_challenges.json"  # 已解决的 challenge 本地缓存
+SOLVED_CACHE_FILE = "solved_challenges.json"
+YAML_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 
-# ★ v2.4: 多 RPC 测速节点列表 (从高性能矿机移植)
-DEFAULT_RPC_LIST = [
-    "https://1rpc.io/bnb",
-    "https://binance.nodereal.io",
-    "https://bsc-mainnet.public.blastapi.io",
-    "https://bsc-dataseed.bnbchain.org",
-    "https://bsc-dataseed1.binance.org",
-]
+IS_WINDOWS = (os.name == "nt")
 
-# Multicall3 合约地址 (BSC / 所有 EVM 链通用)
-MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
-MULTICALL3_ABI = json.loads('''[
-    {"inputs":[{"components":[{"name":"target","type":"address"},{"name":"callData","type":"bytes"}],"name":"calls","type":"tuple[]"}],"name":"aggregate","outputs":[{"name":"blockNumber","type":"uint256"},{"name":"returnData","type":"bytes[]"}],"stateMutability":"view","type":"function"}
-]''')
+MINT_SELECTOR = "1801fbe5"  # mint(uint256,bytes32)
+MINT_TOPIC = "0x" + Web3.keccak(text="Mint(address,uint256,uint256,bytes32)").hex().lstrip("0x")
 
 CONTRACT_ABI = json.loads('''[
     {"inputs":[],"name":"challengeNumber","outputs":[{"type":"bytes32"}],"stateMutability":"view","type":"function"},
@@ -95,22 +119,77 @@ CONTRACT_ABI = json.loads('''[
     {"inputs":[],"name":"totalSupply","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"}
 ]''')
 
+# 默认 relay 节点 (直投验证者, 减少 mempool 延迟)
+DEFAULT_RELAYS = [
+    "https://bsc.rpc.blxrbdn.com",
+    "https://rpc-bsc.48.club",
+    "https://0.48.club",
+]
 
-# ─── 已解决 Challenge 本地缓存 ──────────────────────────────────────────────
+# 默认 WebSocket 节点
+DEFAULT_WS = ["wss://bsc.drpc.org"]
+DEFAULT_HEAD_WS = "wss://bsc-rpc.publicnode.com"
+
+# 默认 RPC 测速列表
+DEFAULT_RPC_LIST = [
+    "https://bsc.rpc.blxrbdn.com",
+    "https://1rpc.io/bnb",
+    "https://binance.nodereal.io",
+    "https://bsc-mainnet.public.blastapi.io",
+    "https://bsc-dataseed.bnbchain.org",
+]
+
+# Multicall3
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
+MULTICALL3_ABI = json.loads('''[
+    {"inputs":[{"components":[{"name":"target","type":"address"},{"name":"callData","type":"bytes"}],"name":"calls","type":"tuple[]"}],"name":"aggregate","outputs":[{"name":"blockNumber","type":"uint256"},{"name":"returnData","type":"bytes[]"}],"stateMutability":"view","type":"function"}
+]''')
+
+
+# ─── YAML 配置加载 ────────────────────────────────────────────────────────────
+
+def load_yaml_config():
+    """加载 config.yaml, 返回字典; 不存在则返回默认值"""
+    defaults = {
+        "private_key": "",
+        "contract_address": CONTRACT_ADDRESS,
+        "chain_id": 56,
+        "use_network_gas": True,
+        "network_gas_multiplier": 1.0,
+        "min_gas_price_gwei": 0.01,
+        "max_gas_price_gwei": 5,
+        "gas_price_gwei": 0.05,
+        "gas_limit": 200000,
+        "solver": "cpu",
+        "gpu_device": "",
+        "gpu_util": 100,
+        "gpu_batch_size": 16000000,
+        "relay_urls": DEFAULT_RELAYS,
+        "ws_urls": DEFAULT_WS,
+        "detect_mode": "auto",
+        "head_ws": DEFAULT_HEAD_WS,
+        "dry_run": False,
+        "verbose_logs": False,
+    }
+    if HAS_YAML and os.path.exists(YAML_CONFIG_FILE):
+        try:
+            with open(YAML_CONFIG_FILE, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            defaults.update(cfg)
+        except Exception:
+            pass
+    return defaults
+
+
+# ─── 已解决 Challenge 缓存 ───────────────────────────────────────────────────
 
 class SolvedChallengeCache:
-    """将已解决的 challenge 缓存到本地文件。
-    下次遇到同样的 challenge 直接跳过，不再浪费 CPU 算力去挖。
-    缓存最多保留 2000 条（防止文件无限膨胀）。"""
-
     MAX_SIZE = 2000
-
     def __init__(self, filepath=SOLVED_CACHE_FILE):
         self._filepath = filepath
         self._lock = threading.Lock()
         self._cache = set()
         self._load()
-
     def _load(self):
         if os.path.exists(self._filepath):
             try:
@@ -119,7 +198,6 @@ class SolvedChallengeCache:
                     self._cache = set(data[-self.MAX_SIZE:])
             except Exception:
                 self._cache = set()
-
     def _save(self):
         try:
             items = list(self._cache)[-self.MAX_SIZE:]
@@ -127,147 +205,29 @@ class SolvedChallengeCache:
                 json.dump(items, f)
         except Exception:
             pass
-
     def is_solved(self, challenge_hex):
-        """检查该 challenge 是否已被解决过"""
         with self._lock:
             return challenge_hex in self._cache
-
     def mark_solved(self, challenge_hex):
-        """标记该 challenge 为已解决"""
         with self._lock:
             self._cache.add(challenge_hex)
-            # 超出上限时裁剪
             if len(self._cache) > self.MAX_SIZE:
                 excess = len(self._cache) - self.MAX_SIZE
                 for _ in range(excess):
                     self._cache.pop()
             self._save()
 
-
-# 全局缓存实例
 _solved_cache = SolvedChallengeCache()
 
-# ─── RPC 限速器 ──────────────────────────────────────────────────────────────
 
-class RPCRateLimiter:
-    """限制 RPC 调用频率，防止被节点封禁。
-    默认最多每秒 5 次请求（BSC 公共节点限制通常为 10 req/s）。
-    挖矿算力完全不受影响——挖矿是纯 CPU 运算，不走 RPC。"""
-
-    def __init__(self, max_calls_per_second=5):
-        self._min_interval = 1.0 / max_calls_per_second
-        self._lock = threading.Lock()
-        self._last_call = 0.0
-
-    def wait(self):
-        with self._lock:
-            now = time.monotonic()
-            elapsed = now - self._last_call
-            if elapsed < self._min_interval:
-                time.sleep(self._min_interval - elapsed)
-            self._last_call = time.monotonic()
-
-
-def create_optimized_provider(rpc_url, rate_limiter=None):
-    """创建带连接池复用 + 限速的 Web3 HTTPProvider。
-    - 连接池复用避免每次 RPC 都重新握手 TLS（减少约 100ms/请求）
-    - 限速保护防止被公共节点 ban IP"""
-    if HAS_REQUESTS:
-        session = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
-        adapter = HTTPAdapter(
-            max_retries=retry_strategy,
-            pool_connections=1,
-            pool_maxsize=5,
-        )
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-
-        # 注入限速到 session 的 post 方法
-        if rate_limiter:
-            original_post = session.post
-            def rate_limited_post(*args, **kwargs):
-                rate_limiter.wait()
-                return original_post(*args, **kwargs)
-            session.post = rate_limited_post
-
-        provider = Web3.HTTPProvider(rpc_url, session=session)
-    else:
-        provider = Web3.HTTPProvider(rpc_url)
-
-    # 增大请求超时，避免偶尔慢响应导致异常
-    provider.request_kwargs = {'timeout': 30}
-    return provider
-
-
-# 全局限速器实例
-_rpc_rate_limiter = RPCRateLimiter(max_calls_per_second=5)
-
-
-# ─── v2.4: 多 RPC 测速选优 ────────────────────────────────────────────────────
-
-def select_best_rpc(rpc_urls, on_log=None):
-    """测速所有 RPC 节点, 返回延迟最低的可达节点 URL.
-    移植自高性能 CLI 矿机的测速逻辑."""
-    best = None
-    best_lat = None
-    for url in rpc_urls:
-        try:
-            t0 = time.time()
-            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 6}))
-            if not w3.is_connected():
-                if on_log:
-                    on_log(f"  {url}  连接失败")
-                continue
-            _ = w3.eth.block_number
-            lat = (time.time() - t0) * 1000
-            if on_log:
-                on_log(f"  {url}  {lat:.0f}ms")
-            if best_lat is None or lat < best_lat:
-                best, best_lat = url, lat
-        except Exception as e:
-            if on_log:
-                on_log(f"  {url}  失败: {str(e)[:40]}")
-    return best, best_lat
-
-
-def get_network_gas_price(w3):
-    """获取网络实时 gas 价格 (Gwei), 失败返回 None"""
-    try:
-        return float(Web3.from_wei(w3.eth.gas_price, "gwei"))
-    except Exception:
-        return None
-
-# ─── Multicall3 批量调用工具 ─────────────────────────────────────────────────
+# ─── RPC 工具 ────────────────────────────────────────────────────────────────
 
 class Multicall:
-    """将多个合约 view 调用打包成 1 次 RPC 请求，大幅降低 RPC 访问频率。
-    挖矿算力完全不受影响，只优化链上查询。"""
-
     def __init__(self, w3):
         self.w3 = w3
         self.multicall = w3.eth.contract(
-            address=Web3.to_checksum_address(MULTICALL3_ADDRESS),
-            abi=MULTICALL3_ABI
-        )
-
+            address=Web3.to_checksum_address(MULTICALL3_ADDRESS), abi=MULTICALL3_ABI)
     def batch_call(self, calls):
-        """批量执行多个合约调用。
-
-        参数:
-            calls: [(contract, function_name, args), ...] 的列表
-                   contract: web3 合约实例
-                   function_name: 函数名字符串
-                   args: 参数元组 (无参数传空元组)
-
-        返回:
-            原始 bytes 列表，每个元素对应一个调用的返回值 (ABI 编码)
-        """
         aggregate_calls = []
         decoders = []
         for contract, fn_name, args in calls:
@@ -275,19 +235,611 @@ class Multicall:
             call_data = fn._encode_transaction_data()
             aggregate_calls.append((contract.address, call_data))
             decoders.append(fn)
-
         _, return_data = self.multicall.functions.aggregate(aggregate_calls).call()
-
         results = []
         for i, raw in enumerate(return_data):
             fn = decoders[i]
-            # 解码 ABI 返回值
             output_types = [o['type'] for o in fn.abi['outputs']]
             decoded = self.w3.codec.decode(output_types, raw)
             results.append(decoded[0] if len(decoded) == 1 else decoded)
         return results
 
-# ─── Bitcoin Wallet Theme Colors ─────────────────────────────────────────────
+
+def select_best_rpc(rpc_urls, on_log=None):
+    best, best_lat = None, None
+    for url in rpc_urls:
+        try:
+            t0 = time.time()
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 6}))
+            if not w3.is_connected():
+                if on_log: on_log(f"  {url}  连接失败")
+                continue
+            _ = w3.eth.block_number
+            lat = (time.time() - t0) * 1000
+            if on_log: on_log(f"  {url}  {lat:.0f}ms")
+            if best_lat is None or lat < best_lat:
+                best, best_lat = url, lat
+        except Exception as e:
+            if on_log: on_log(f"  {url}  失败: {str(e)[:40]}")
+    return best, best_lat
+
+
+# ─── 广播器: 同一签名交易并行发往多个 relay ──────────────────────────────────
+
+class Broadcaster:
+    """复用 keep-alive 连接, 同一签名交易并行广播到多个直投验证者 relay."""
+    def __init__(self, urls):
+        self.urls = urls
+        self.sessions = {}
+        for u in urls:
+            s = requests.Session()
+            s.headers.update({"Content-Type": "application/json"})
+            self.sessions[u] = s
+        self._warm()
+
+    def _warm(self):
+        for u, s in self.sessions.items():
+            try:
+                s.post(u, json={"jsonrpc": "2.0", "id": 1,
+                                "method": "eth_blockNumber", "params": []}, timeout=5)
+            except Exception:
+                pass
+
+    def _send_one(self, url, raw_hex):
+        t0 = time.perf_counter()
+        try:
+            r = self.sessions[url].post(url, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "eth_sendRawTransaction", "params": [raw_hex]}, timeout=5)
+            j = r.json()
+            ms = (time.perf_counter() - t0) * 1000
+            if "result" in j:
+                return (url, True, ms, j["result"])
+            err = str(j.get("error", {}).get("message", j))[:60]
+            known = any(s in err.lower() for s in
+                        ("already known", "known transaction", "already imported"))
+            return (url, known, ms, err)
+        except Exception as e:
+            return (url, False, (time.perf_counter() - t0) * 1000, str(e)[:50])
+
+    def broadcast(self, raw_hex):
+        results = []
+        threads = []
+        lock = threading.Lock()
+        def run(u):
+            res = self._send_one(u, raw_hex)
+            with lock:
+                results.append(res)
+        for u in self.urls:
+            t = threading.Thread(target=run, args=(u,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=5)
+        return results
+
+
+# ─── Gas 策略: 跟网络地板价 ──────────────────────────────────────────────────
+
+def gas_price_wei(w3, cfg):
+    """跟网络地板价, 不加价 (与对手一致, 省钱)."""
+    try:
+        net = w3.eth.gas_price
+    except Exception:
+        net = Web3.to_wei(float(cfg.get("gas_price_gwei", 0.05)), "gwei")
+    if cfg.get("use_network_gas", True):
+        g = int(net * float(cfg.get("network_gas_multiplier", 1.0)))
+        lo = Web3.to_wei(float(cfg.get("min_gas_price_gwei", 0.01)), "gwei")
+        hi = Web3.to_wei(float(cfg.get("max_gas_price_gwei", 5)), "gwei")
+        return max(lo, min(g, hi))
+    return Web3.to_wei(float(cfg.get("gas_price_gwei", 0.05)), "gwei")
+
+
+# ─── CPU 常驻热池 (多进程, 零冷启动) ──────────────────────────────────────────
+
+def warm_worker(wid, num_workers, prefix_arr, target_arr, gen_val, base_val,
+                stop_event, result_q):
+    """常驻 CPU 求解进程: 从共享内存读 (prefix, target, generation),
+    挑战号一变立刻切到新解, 零冷启动."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    from Crypto.Hash import keccak as _kc
+    new = _kc.new
+    local_gen = -1
+    prefix = b""
+    target = 0
+    nonce = 0
+    step = num_workers
+    BATCH = 8192
+    while not stop_event.is_set():
+        g = gen_val.value
+        if g == 0:
+            time.sleep(0.002)
+            continue
+        if g != local_gen:
+            local_gen = g
+            with prefix_arr.get_lock():
+                prefix = bytes(prefix_arr[:])
+            with target_arr.get_lock():
+                target = int.from_bytes(bytes(target_arr[:]), "big")
+            nonce = (base_val.value + wid) & ((1 << 64) - 1)
+        hit = False
+        for _ in range(BATCH):
+            k = new(digest_bits=256)
+            k.update(prefix + nonce.to_bytes(32, "big"))
+            d = k.digest()
+            if int.from_bytes(d, "big") <= target:
+                result_q.put((local_gen, nonce, d))
+                hit = True
+                break
+            nonce += step
+        if hit:
+            while gen_val.value == local_gen and not stop_event.is_set():
+                time.sleep(0.005)
+
+
+def resolve_workers(cfg):
+    cores = os.cpu_count() or 4
+    try:
+        pct = float(cfg.get("cpu_percent", 0) or 0)
+    except (TypeError, ValueError):
+        pct = 0
+    if pct > 0:
+        return max(1, round(cores * pct / 100))
+    w = cfg.get("workers", "auto")
+    if isinstance(w, int):
+        return max(1, w)
+    if isinstance(w, str) and w.isdigit():
+        return max(1, int(w))
+    if w == "max":
+        return max(1, cores - 1)
+    return max(1, cores // 2)
+
+
+class CpuPool:
+    """常驻多进程 CPU 求解池, 挑战号一变立刻切换, 零冷启动."""
+    def __init__(self, cfg):
+        method = cfg.get("start_method", "fork")
+        if IS_WINDOWS:
+            method = "spawn"
+        try:
+            self.ctx = multiprocessing.get_context(method)
+        except ValueError:
+            self.ctx = multiprocessing.get_context()
+        self.n = resolve_workers(cfg)
+        self.prefix = self.ctx.Array("B", 52)
+        self.target = self.ctx.Array("B", 32)
+        self.gen = self.ctx.Value("l", 0)
+        self.base = self.ctx.Value("Q", 0)
+        self.stop = self.ctx.Event()
+        self.result_q = self.ctx.Queue()
+        self.procs = []
+        for wid in range(self.n):
+            p = self.ctx.Process(target=warm_worker,
+                                 args=(wid, self.n, self.prefix, self.target,
+                                       self.gen, self.base, self.stop, self.result_q),
+                                 daemon=True)
+            p.start()
+            self.procs.append(p)
+
+    def set_challenge(self, prefix_bytes, target_int, gen, base_nonce):
+        with self.prefix.get_lock():
+            self.prefix[:] = prefix_bytes
+        with self.target.get_lock():
+            self.target[:] = target_int.to_bytes(32, "big")
+        self.base.value = base_nonce & ((1 << 64) - 1)
+        self.gen.value = gen
+
+    def shutdown(self):
+        self.stop.set()
+
+
+# ─── GPU 求解器 ──────────────────────────────────────────────────────────────
+
+class GpuSolver:
+    """GPU OpenCL 求解器, 高难度时比 CPU 快得多."""
+    def __init__(self, cfg):
+        from gpu_miner import GpuMiner
+        self.gpu = GpuMiner(cfg)
+        util = cfg.get("gpu_util", 100)
+        try:
+            util = float(util)
+        except (TypeError, ValueError):
+            util = 100.0
+        self.gpu.target_util = min(100.0, max(1.0, util))
+        self.util = self.gpu.target_util
+        self.batch = int(cfg.get("gpu_batch_size", 1_000_000))
+        self.name = self.gpu.device_name
+
+    def solve(self, prefix, target_bytes, target_int, start):
+        n = start & ((1 << 48) - 1)
+        while True:
+            win = self.gpu.search(prefix, target_bytes, n, self.batch)
+            if win is not None:
+                k = _pycryptodome_keccak.new(digest_bits=256)
+                k.update(prefix + int(win).to_bytes(32, "big"))
+                d = k.digest()
+                if int.from_bytes(d, "big") <= target_int:
+                    return int(win), d
+            n += self.batch
+        return None, None
+
+
+# ─── 反应式挖矿引擎 (整合测试安装包全部规则) ─────────────────────────────────
+
+class ReactiveMiner:
+    """整合测试安装包的全部挖矿规则:
+    - WS 订阅 Mint 事件检测新挑战号 (零轮询)
+    - CPU 热池 / GPU 求解
+    - 多 relay 并行广播
+    - Gas 跟网络地板价
+    - 过期解自动丢弃
+    - 试运行模式
+    """
+    def __init__(self, cfg, on_log=None, on_win=None, on_lose=None, on_stats=None):
+        self.cfg = cfg
+        self.on_log = on_log or (lambda msg, lv="INFO": None)
+        self.on_win = on_win or (lambda epoch: None)
+        self.on_lose = on_lose or (lambda: None)
+        self.on_stats = on_stats or (lambda s: None)
+        self.running = False
+        self.dry = bool(os.environ.get("DRY_RUN")) or bool(cfg.get("dry_run", False))
+        self.verbose = bool(cfg.get("verbose_logs", False))
+
+        # Web3 连接 (用 relay 里最快的做 setup RPC)
+        setup_rpc = (cfg.get("relay_urls") or DEFAULT_RELAYS)[0]
+        self.w3 = Web3(Web3.HTTPProvider(setup_rpc, request_kwargs={"timeout": 8}))
+        try:
+            self.w3.middleware_onion.inject(_POA, layer=0)
+        except Exception:
+            self.w3.middleware_onion.inject(_POA(self.w3), layer=0)
+
+        pk = cfg.get("_pk") or cfg.get("private_key", "")
+        if not pk.startswith("0x"):
+            pk = "0x" + pk
+        self.acct = self.w3.eth.account.from_key(pk)
+        self.me = self.acct.address
+        self.me_lc = self.me.lower()
+        self.addr_bytes = bytes.fromhex(self.me[2:])
+        self.contract_addr = Web3.to_checksum_address(cfg.get("contract_address", CONTRACT_ADDRESS))
+        self.chain_id = int(cfg.get("chain_id", 56))
+        self.gas_limit = int(cfg.get("gas_limit", 200000))
+        self.c = self.w3.eth.contract(address=self.contract_addr, abi=CONTRACT_ABI)
+
+        # 状态
+        self.target = self.c.functions.miningTarget().call()
+        self.difficulty = self.c.functions.getMiningDifficulty().call()
+        self.gas_wei = gas_price_wei(self.w3, cfg)
+        self.nonce = self.w3.eth.get_transaction_count(self.me, "pending")
+        self.nlock = threading.Lock()
+        self.last_fired_challenge = None
+        self.last_fire_ts = 0.0
+
+        # 统计
+        self.sent = 0
+        self.won = 0
+        self.lost = 0
+        self.fired_challenges = set()
+        self.start_time = time.time()
+
+        # 求解器
+        self.mode = str(cfg.get("solver", "cpu")).lower()
+        if self.mode not in ("cpu", "gpu"):
+            self.mode = "cpu"
+        self.gpu = None
+        self.pool = None
+        self.cur_gen = 0
+        self.gen_meta = {}
+        self.fired_gen = -1
+        self.submitted_gen = -1
+
+        if self.mode == "gpu":
+            try:
+                self.gpu = GpuSolver(cfg)
+                self.on_log(f"求解器: GPU {self.gpu.name}  占用 {self.gpu.util:.0f}%")
+            except Exception as e:
+                self.on_log(f"GPU 不可用, 退回 CPU 热池: {str(e)[:70]}")
+                self.mode = "cpu"
+        if self.mode == "cpu":
+            self.pool = CpuPool(cfg)
+            self.on_log(f"求解器: CPU 热池 ({self.pool.n} 进程, 常驻预热)")
+
+        self.bc = None if self.dry else Broadcaster(cfg.get("relay_urls") or DEFAULT_RELAYS)
+
+    def start(self):
+        self.running = True
+        # 后台刷新线程
+        threading.Thread(target=self._refresh_loop, daemon=True).start()
+        # 统计线程
+        threading.Thread(target=self._stats_loop, daemon=True).start()
+        # CPU 收集线程
+        if self.mode == "cpu":
+            threading.Thread(target=self._collector, daemon=True).start()
+        # 启动时先为当前挑战号算一发
+        try:
+            cur = self.c.functions.challengeNumber().call().hex()
+            cur = cur if cur.startswith("0x") else "0x" + cur
+            self.set_challenge(cur)
+        except Exception:
+            pass
+        # WebSocket 检测线程
+        threading.Thread(target=self._ws_thread, daemon=True).start()
+
+    def stop(self):
+        self.running = False
+        if self.pool:
+            self.pool.shutdown()
+
+    def set_challenge(self, challenge_hex):
+        ch = bytes.fromhex(challenge_hex[2:] if challenge_hex.startswith("0x") else challenge_hex)
+        if ch in self.fired_challenges:
+            return
+        with self.nlock:
+            self.cur_gen += 1
+            gen = self.cur_gen
+        self.gen_meta[gen] = (ch, time.perf_counter())
+        self.last_fired_challenge = ch
+        prefix = ch + self.addr_bytes
+        base = random.getrandbits(64)
+        if self.mode == "cpu":
+            self.pool.set_challenge(prefix, self.target, gen, base)
+        else:
+            threading.Thread(target=self._gpu_solve, args=(gen, ch, prefix, base),
+                             daemon=True).start()
+
+    def _gpu_solve(self, gen, ch, prefix, base):
+        tb = self.target.to_bytes(32, "big")
+        n = base & ((1 << 48) - 1)
+        while self.running and gen == self.cur_gen:
+            win = self.gpu.gpu.search(prefix, tb, n, self.gpu.batch)
+            if win is not None:
+                k = _pycryptodome_keccak.new(digest_bits=256)
+                k.update(prefix + int(win).to_bytes(32, "big"))
+                d = k.digest()
+                if int.from_bytes(d, "big") <= self.target:
+                    self._submit_solution(gen, int(win), d)
+                    return
+            n += self.gpu.batch
+
+    def _collector(self):
+        while self.running:
+            try:
+                gen, nonce, digest = self.pool.result_q.get(timeout=1.0)
+            except Exception:
+                continue
+            self._submit_solution(gen, nonce, digest)
+
+    def _submit_solution(self, gen, nonce_v, digest):
+        if gen != self.cur_gen or gen == self.fired_gen:
+            return
+        meta = self.gen_meta.get(gen)
+        if meta is None:
+            return
+        ch, t0 = meta
+        self.fired_gen = gen
+
+        with self.nlock:
+            tx_nonce = self.nonce
+            self.nonce += 1
+        calldata = ("0x" + MINT_SELECTOR
+                    + nonce_v.to_bytes(32, "big").hex() + digest.hex())
+        tx = {"to": self.contract_addr, "value": 0, "data": calldata,
+              "gas": self.gas_limit, "gasPrice": self.gas_wei,
+              "nonce": tx_nonce, "chainId": self.chain_id}
+        signed = self.acct.sign_transaction(tx)
+        raw_hex = signed.raw_transaction.hex()
+        if not raw_hex.startswith("0x"):
+            raw_hex = "0x" + raw_hex
+        solve_ms = (time.perf_counter() - t0) * 1000
+
+        self.fired_challenges.add(ch)
+        self.last_fire_ts = time.time()
+
+        if self.dry:
+            self.on_log(f"[DRY] 挑战 {ch.hex()[:12]}.. 解出 nonce={nonce_v} "
+                        f"算解+签 {solve_ms:.1f}ms (未广播)")
+            return
+
+        if gen != self.cur_gen:
+            with self.nlock:
+                self.nonce = min(self.nonce, tx_nonce)
+            return
+        results = self.bc.broadcast(raw_hex)
+        self.sent += 1
+        oks = [r for r in results if r[1]]
+        if oks:
+            self.submitted_gen = gen
+        if self.verbose:
+            best = min((r[2] for r in oks), default=None)
+            total_ms = (time.perf_counter() - t0) * 1000
+            tag = f"解+签+广播 {best:.0f}ms" if best else "广播全失败"
+            self.on_log(f"→ 发出 挑战 {ch.hex()[:12]}.. nonce={tx_nonce} "
+                        f"接受 {len(oks)}/{len(results)} 路  端到端 {total_ms:.0f}ms ({tag})")
+        if not oks:
+            with self.nlock:
+                self.nonce = min(self.nonce, tx_nonce)
+
+    def on_mint(self, log_obj):
+        data = log_obj["data"]
+        data = data.hex() if hasattr(data, "hex") else data
+        data = data[2:] if data.startswith("0x") else data
+        epoch = int(data[64:128], 16)
+        new_challenge = "0x" + data[128:192]
+        frm = log_obj["topics"][1]
+        frm = frm.hex() if hasattr(frm, "hex") else frm
+        frm = frm[2:] if frm.startswith("0x") else frm
+        frm_addr = "0x" + frm[-40:]
+        won = frm_addr.lower() == self.me_lc
+        resolved_gen = self.cur_gen
+        did_submit = (self.submitted_gen == resolved_gen and resolved_gen != 0)
+        if won:
+            self.won += 1
+            self.on_log(f"✓ 成功 mint!  第 {self.won} 块  epoch={epoch}")
+            self.on_win(epoch)
+        elif did_submit:
+            self.lost += 1
+            self.on_log(f"✗ 失败 (被抢先)  累计 成功 {self.won} / 失败 {self.lost}")
+            self.on_lose()
+        self.set_challenge(new_challenge)
+
+    def fetch_block_mint(self, block_num):
+        try:
+            logs = self.w3.eth.get_logs({
+                "address": self.contract_addr, "topics": [MINT_TOPIC],
+                "fromBlock": block_num, "toBlock": block_num})
+            return logs[-1] if logs else None
+        except Exception:
+            return None
+
+    def _refresh_loop(self):
+        while self.running:
+            time.sleep(10)
+            try:
+                d = self.c.functions.getMiningDifficulty().call()
+                if d != self.difficulty:
+                    self.target = self.c.functions.miningTarget().call()
+                    self.on_log(f"难度变化 {self.difficulty} -> {d}")
+                    self.difficulty = d
+            except Exception:
+                pass
+            try:
+                self.gas_wei = gas_price_wei(self.w3, self.cfg)
+            except Exception:
+                pass
+            if time.time() - self.last_fire_ts > 3:
+                try:
+                    chain_n = self.w3.eth.get_transaction_count(self.me, "pending")
+                    with self.nlock:
+                        if chain_n != self.nonce:
+                            self.nonce = chain_n
+                except Exception:
+                    pass
+
+    def _stats_loop(self):
+        while self.running:
+            time.sleep(15)
+            el = time.time() - self.start_time
+            settled = self.won + self.lost
+            wr = (self.won / settled * 100) if settled else 0
+            stats = {
+                "elapsed": el, "sent": self.sent, "won": self.won,
+                "lost": self.lost, "win_rate": wr, "difficulty": self.difficulty,
+                "mode": self.mode.upper(),
+            }
+            self.on_stats(stats)
+            if self.verbose:
+                self.on_log(f"── 统计 运行 {el:.0f}s  发出 {self.sent}  赢 {self.won}  "
+                            f"输 {self.lost}  胜率 {wr:.0f}%  难度 {self.difficulty}  "
+                            f"模式 {self.mode.upper()}")
+
+    # ── WebSocket 检测层 ──
+
+    def _ws_thread(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._detect())
+        except Exception:
+            pass
+
+    async def _detect(self):
+        mode = str(self.cfg.get("detect_mode", "auto")).lower()
+        head_ws = self.cfg.get("head_ws") or DEFAULT_HEAD_WS
+        if mode in ("logs", "auto"):
+            ok = await self._logs_loop(self.cfg.get("ws_urls") or DEFAULT_WS)
+            if ok or mode == "logs" or not self.running:
+                return
+            self.on_log("logs-WS 连续失败, 自动切到 heads 模式")
+        await self._heads_loop(head_ws)
+
+    async def _logs_loop(self, urls):
+        if not HAS_WS:
+            self.on_log("websockets 未安装, 无法使用 logs 模式")
+            return False
+        flt = {"address": self.contract_addr.lower(), "topics": [MINT_TOPIC]}
+        fails = 0
+        i = 0
+        while self.running:
+            url = urls[i % len(urls)]
+            i += 1
+            try:
+                async with websockets.connect(url, open_timeout=10, ping_interval=None,
+                                              max_size=None) as ws:
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1,
+                        "method": "eth_subscribe", "params": ["logs", flt]}))
+                    sub = json.loads(await asyncio.wait_for(ws.recv(), 10))
+                    if "result" not in sub:
+                        raise RuntimeError(str(sub.get("error", sub))[:60])
+                    self.on_log(f"WS 监听已连接 (logs @ {url})")
+                    fails = 0
+                    while self.running:
+                        m = json.loads(await asyncio.wait_for(ws.recv(), 90))
+                        p = m.get("params", {}).get("result")
+                        if p:
+                            self.on_mint(p)
+            except Exception as e:
+                if not self.running:
+                    break
+                fails += 1
+                if self.verbose:
+                    self.on_log(f"logs-WS 失败 ({url}): {type(e).__name__} {str(e)[:50]}")
+                if fails >= 3:
+                    return False
+                await asyncio.sleep(2)
+        return True
+
+    async def _heads_loop(self, head_ws):
+        if not HAS_WS:
+            self.on_log("websockets 未安装, 无法使用 heads 模式, 退回轮询")
+            await self._poll_fallback()
+            return
+        loop = asyncio.get_event_loop()
+        last_block = 0
+        while self.running:
+            try:
+                async with websockets.connect(head_ws, open_timeout=10, ping_interval=None,
+                                              max_size=None) as ws:
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1,
+                        "method": "eth_subscribe", "params": ["newHeads"]}))
+                    sub = json.loads(await asyncio.wait_for(ws.recv(), 10))
+                    if "result" not in sub:
+                        raise RuntimeError(str(sub.get("error", sub))[:60])
+                    self.on_log(f"WS 监听已连接 (heads @ {head_ws})")
+                    while self.running:
+                        m = json.loads(await asyncio.wait_for(ws.recv(), 90))
+                        p = m.get("params", {}).get("result")
+                        if not p:
+                            continue
+                        bn = int(p["number"], 16)
+                        if bn <= last_block:
+                            continue
+                        last_block = bn
+                        lg = await loop.run_in_executor(None, self.fetch_block_mint, bn)
+                        if lg:
+                            self.on_mint(lg)
+            except Exception as e:
+                if not self.running:
+                    break
+                if self.verbose:
+                    self.on_log(f"heads-WS 断开: {type(e).__name__} {str(e)[:50]} — 2s 重连")
+                await asyncio.sleep(2)
+
+    async def _poll_fallback(self):
+        """无 websockets 时的轮询兜底"""
+        self.on_log("使用轮询模式检测新挑战号 (建议安装 websockets 以获得更快检测)")
+        last_challenge = None
+        while self.running:
+            try:
+                ch = self.c.functions.challengeNumber().call()
+                ch_hex = "0x" + ch.hex()
+                if last_challenge is not None and ch != last_challenge:
+                    self.set_challenge(ch_hex)
+                last_challenge = ch
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+
+
+# ─── Bitcoin 风格配色 ────────────────────────────────────────────────────────
 
 COLORS = {
     'bg':           '#0d1117',
@@ -295,9 +847,8 @@ COLORS = {
     'bg_card2':     '#1c2333',
     'bg_input':     '#0d1117',
     'bg_hover':     '#21262d',
-    'accent':       '#f7931a',    # Bitcoin orange
+    'accent':       '#f7931a',
     'accent_dark':  '#e8850f',
-    'accent_glow':  '#f7931a33',
     'green':        '#3fb950',
     'green_dim':    '#238636',
     'red':          '#f85149',
@@ -313,12 +864,12 @@ COLORS = {
     'black':        '#000000',
 }
 
-# ─── I18N ────────────────────────────────────────────────────────────────────
+# ─── 国际化 ──────────────────────────────────────────────────────────────────
 
 LANG = {
     'en': {
         'title': 'Satoshi Miner',
-        'subtitle': 'BSC PoW Mining Client',
+        'subtitle': 'BSC PoW Reactive Mining',
         'tab_wallet': 'Wallet',
         'tab_mine': 'Mine',
         'tab_history': 'History',
@@ -326,8 +877,7 @@ LANG = {
         'connection': 'Connection',
         'rpc_url': 'RPC Endpoint',
         'private_key': 'Private Key',
-        'show': 'Show',
-        'hide': 'Hide',
+        'show': 'Show', 'hide': 'Hide',
         'connect': 'Connect Wallet',
         'disconnect': 'Disconnect',
         'wallet_overview': 'Wallet Overview',
@@ -348,11 +898,8 @@ LANG = {
         'uptime': 'Uptime',
         'mining_log': 'Mining Log',
         'clear_log': 'Clear',
-        'time': 'Time',
-        'nonce': 'Nonce',
-        'reward': 'Reward',
-        'tx_hash': 'TX Hash',
-        'status': 'Status',
+        'time': 'Time', 'nonce': 'Nonce', 'reward': 'Reward',
+        'tx_hash': 'TX Hash', 'status': 'Status',
         'gas_settings': 'Gas Settings',
         'gas_price': 'Gas Price (Gwei)',
         'gas_limit': 'Gas Limit',
@@ -360,10 +907,10 @@ LANG = {
         'save_settings': 'Save Settings',
         'about': 'About',
         'about_text': (
-            "Satoshi (SAT) is a Proof-of-Work mineable ERC20 token on BSC.\n"
+            "Satoshi (SAT) PoW Miner v3.0 — Reactive Mining Edition\n"
+            "Features: WS Mint event detection, GPU/CPU solver,\n"
+            "multi-relay broadcast, floor gas price tracking.\n"
             "Total Supply: 21,000,000 SAT (8 decimals)\n"
-            "Initial Reward: 50 SAT per block, halving every era\n"
-            "Difficulty adjusts every 1024 epochs\n"
             "Mining: keccak256(challenge, address, nonce) <= target"
         ),
         'not_connected': 'Disconnected',
@@ -373,19 +920,16 @@ LANG = {
         'halving': 'Halving',
         'every_era': 'Every Era',
         'contract_info': 'Contract Info',
-        'success': 'Success',
-        'failed': 'Failed',
-        'error': 'Error',
+        'success': 'Success', 'failed': 'Failed', 'error': 'Error',
         'no_history': 'No mining history yet',
-        'mining_started': 'Mining started...',
+        'mining_started': 'Reactive mining started...',
         'mining_stopped': 'Mining stopped',
         'connect_first': 'Please connect wallet first',
         'enter_rpc': 'Please enter RPC URL',
         'enter_pk': 'Please enter private key',
         'conn_failed': 'Connection failed',
         'settings_saved': 'Settings saved',
-        'copy': 'Copy',
-        'copied': 'Copied!',
+        'copy': 'Copy', 'copied': 'Copied!',
         'mining_active': 'MINING ACTIVE',
         'mining_idle': 'IDLE',
         'total_hashes': 'Total Hashes',
@@ -394,10 +938,17 @@ LANG = {
         'no_records': 'No records yet. Start mining to see results here.',
         'save_pk': 'Save Private Key Locally',
         'save_pk_tip': '(Base64 obfuscated, not plaintext)',
+        'solver_mode': 'Solver Mode',
+        'ws_status': 'WS Status',
+        'relay_count': 'Relay Nodes',
+        'win_rate': 'Win Rate',
+        'sent_count': 'TX Sent',
+        'won_count': 'Won',
+        'lost_count': 'Lost',
     },
     'zh': {
         'title': 'Satoshi 矿机',
-        'subtitle': 'BSC PoW 挖矿客户端',
+        'subtitle': 'BSC PoW 反应式挖矿',
         'tab_wallet': '钱包',
         'tab_mine': '挖矿',
         'tab_history': '记录',
@@ -405,8 +956,7 @@ LANG = {
         'connection': '连接设置',
         'rpc_url': 'RPC 节点',
         'private_key': '私钥',
-        'show': '显示',
-        'hide': '隐藏',
+        'show': '显示', 'hide': '隐藏',
         'connect': '连接钱包',
         'disconnect': '断开连接',
         'wallet_overview': '钱包总览',
@@ -427,11 +977,8 @@ LANG = {
         'uptime': '运行时间',
         'mining_log': '挖矿日志',
         'clear_log': '清除',
-        'time': '时间',
-        'nonce': 'Nonce',
-        'reward': '奖励',
-        'tx_hash': '交易哈希',
-        'status': '状态',
+        'time': '时间', 'nonce': 'Nonce', 'reward': '奖励',
+        'tx_hash': '交易哈希', 'status': '状态',
         'gas_settings': 'Gas 设置',
         'gas_price': 'Gas 价格 (Gwei)',
         'gas_limit': 'Gas 上限',
@@ -439,11 +986,11 @@ LANG = {
         'save_settings': '保存设置',
         'about': '关于',
         'about_text': (
-            "Satoshi (SAT) 是一个基于 BSC 的工作量证明 ERC20 代币。\n"
+            "Satoshi (SAT) PoW 矿机 v3.0 — 反应式挖矿版\n"
+            "特性：WS Mint 事件检测、GPU/CPU 求解器、\n"
+            "多 relay 并行广播、Gas 跟网络地板价。\n"
             "总供应量：21,000,000 SAT（8位小数）\n"
-            "初始奖励：每区块 50 SAT，每个时代减半\n"
-            "难度每 1024 个纪元调整一次\n"
-            "挖矿原理：keccak256(challenge, address, nonce) <= target"
+            "挖矿：keccak256(challenge, address, nonce) <= target"
         ),
         'not_connected': '未连接',
         'connected': '已连接',
@@ -452,19 +999,16 @@ LANG = {
         'halving': '减半',
         'every_era': '每个时代',
         'contract_info': '合约信息',
-        'success': '成功',
-        'failed': '失败',
-        'error': '错误',
+        'success': '成功', 'failed': '失败', 'error': '错误',
         'no_history': '暂无挖矿记录',
-        'mining_started': '挖矿已开始...',
+        'mining_started': '反应式挖矿已开始...',
         'mining_stopped': '挖矿已停止',
         'connect_first': '请先连接钱包',
         'enter_rpc': '请输入 RPC 地址',
         'enter_pk': '请输入私钥',
         'conn_failed': '连接失败',
         'settings_saved': '设置已保存',
-        'copy': '复制',
-        'copied': '已复制!',
+        'copy': '复制', 'copied': '已复制!',
         'mining_active': '挖矿中',
         'mining_idle': '空闲',
         'total_hashes': '总哈希数',
@@ -473,309 +1017,19 @@ LANG = {
         'no_records': '暂无记录。开始挖矿后将在此显示结果。',
         'save_pk': '保存私钥到本地',
         'save_pk_tip': '(Base64 混淆存储，非明文)',
+        'solver_mode': '求解模式',
+        'ws_status': 'WS 状态',
+        'relay_count': 'Relay 节点',
+        'win_rate': '胜率',
+        'sent_count': '已发送',
+        'won_count': '成功',
+        'lost_count': '失败',
     }
 }
 
-# ─── Mining Engine (Optimized: multiprocessing + fast inner loop) ────────────
-
-# Try to use fast native keccak implementation
-try:
-    from Crypto.Hash import keccak as _pycryptodome_keccak
-    def _fast_keccak256(data):
-        return _pycryptodome_keccak.new(digest_bits=256, data=data).digest()
-    KECCAK_ENGINE = "pycryptodome"
-except ImportError:
-    try:
-        import sha3 as _pysha3
-        def _fast_keccak256(data):
-            return _pysha3.keccak_256(data).digest()
-        KECCAK_ENGINE = "pysha3"
-    except ImportError:
-        def _fast_keccak256(data):
-            return bytes(Web3.keccak(data))
-        KECCAK_ENGINE = "web3 (slow)"
-
-
-def _increment_nonce_bytes(nonce_ba):
-    """Increment a 32-byte big-endian bytearray in-place. Much faster than
-    int.to_bytes() conversion on every iteration."""
-    for i in range(31, -1, -1):
-        nonce_ba[i] = (nonce_ba[i] + 1) & 0xFF
-        if nonce_ba[i] != 0:
-            return
-    # overflow wraps around (extremely unlikely for 256-bit)
-
-
-def _mining_worker(worker_id, prefix_bytes, target_bytes, num_workers,
-                   stop_flag, result_nonce, result_digest,
-                   hashrate_array, total_hashes_array, base_nonce_val=0):
-    """Standalone mining worker that runs in its own process (no GIL).
-    ★ v2.4 优化:
-    - 步进式(stride) nonce 分配: worker_id 起步, 步长 num_workers, 保证零重叠
-    - C 扩展批次缩小到 50K, 更快响应 challenge 变更 (减少无效算力)
-    - Python 模式同步优化步进 nonce"""
-
-    # 尝试在子进程中导入 C 扩展
-    _use_c_ext = False
-    try:
-        import keccak_pow as _keccak_pow_mod
-        _use_c_ext = True
-    except ImportError:
-        _use_c_ext = False
-
-    # Python fallback: Re-import keccak inside the child process
-    keccak = None
-    if not _use_c_ext:
-        try:
-            from Crypto.Hash import keccak as _keccak_mod
-            def keccak(data):
-                return _keccak_mod.new(digest_bits=256, data=data).digest()
-        except ImportError:
-            try:
-                import sha3 as _sha3_mod
-                def keccak(data):
-                    return _sha3_mod.keccak_256(data).digest()
-            except ImportError:
-                from web3 import Web3 as _W3
-                def keccak(data):
-                    return bytes(_W3.keccak(data))
-
-    # ★ 步进式 nonce 分配: 每个 worker 从 base+worker_id 开始, 步长 num_workers
-    # 这保证 N 个 worker 覆盖连续 nonce 空间且完全不重叠
-    prefix = bytes(prefix_bytes)
-    target = bytes(target_bytes)
-    prefix_len = len(prefix)
-
-    last_time = time.monotonic()
-    local_hashes = 0
-
-    if _use_c_ext:
-        # ═══ C 扩展加速路径 ═══
-        # ★ v2.4: 批次从 500K 缩小到 50K, 更快检测 stop_flag / challenge 变更
-        # 每个 worker 负责独立的 nonce 段: [base+wid*chunk, base+wid*chunk+chunk)
-        c_batch = 50_000
-        # 用步进方式分段: worker 0 扫 [base, base+chunk), worker 1 扫 [base+chunk, base+2*chunk)...
-        # 每扫完一轮(num_workers*chunk), 各 worker 进入下一轮自己的段
-        chunk = c_batch
-        round_size = chunk * num_workers
-        current_nonce = base_nonce_val + worker_id * chunk
-
-        while not stop_flag.value:
-            res = _keccak_pow_mod.pow_search(prefix, target, current_nonce, chunk)
-            if res:
-                found_nonce, found_digest = res
-                if stop_flag.value:
-                    return
-                stop_flag.value = 1
-                result_nonce.value = found_nonce
-                result_digest[:] = found_digest
-                return
-            local_hashes += chunk
-            # 跳到下一轮自己的段
-            current_nonce += round_size
-
-            now = time.monotonic()
-            elapsed = now - last_time
-            if elapsed >= 2.0:
-                rate = local_hashes / elapsed
-                hashrate_array[worker_id] = rate
-                total_hashes_array[worker_id] += local_hashes
-                last_time = now
-                local_hashes = 0
-    else:
-        # ═══ Python 步进模式 ═══
-        # ★ v2.4: 同样使用步进分配, 避免 worker 间 nonce 重叠
-        nonce_int = base_nonce_val + worker_id
-        step = num_workers
-        py_batch = 8192  # 每批次检查 stop, 与高性能 CLI 矿机对齐
-
-        while not stop_flag.value:
-            for _ in range(py_batch):
-                data = prefix + nonce_int.to_bytes(32, 'big')
-                digest = keccak(data)
-                if digest <= target:
-                    if stop_flag.value:
-                        return
-                    stop_flag.value = 1
-                    result_nonce.value = nonce_int
-                    result_digest[:] = digest
-                    return
-                nonce_int += step
-
-            local_hashes += py_batch
-
-            now = time.monotonic()
-            elapsed = now - last_time
-            if elapsed >= 2.0:
-                rate = local_hashes / elapsed
-                hashrate_array[worker_id] = rate
-                total_hashes_array[worker_id] += local_hashes
-                last_time = now
-                local_hashes = 0
-
-
-class MiningEngine:
-    """Multi-process mining engine. Each CPU core runs an independent process,
-    bypassing the GIL for true parallel hashing."""
-
-    def __init__(self, w3, contract, account, on_log, on_found, multicall=None, num_threads=None):
-        self.w3 = w3
-        self.contract = contract
-        self.account = account
-        self.on_log = on_log
-        self.on_found = on_found
-        self.multicall = multicall
-        self.running = False
-        self.hashrate = 0
-        self.total_hashes = 0
-        self.num_workers = num_threads or max(1, os.cpu_count() or 1)
-        self._processes = []
-        self._retry_delay = 5  # 指数退避初始值
-
-    def start(self):
-        self.running = True
-        self._retry_delay = 5
-        engine_name = "C-Extension (keccak_pow)" if HAS_C_EXT else KECCAK_ENGINE
-        self.on_log(f"Keccak engine: {engine_name} | Workers: {self.num_workers} (multiprocessing)")
-        self.on_log(f"已加载本地缓存，已知 {len(_solved_cache._cache)} 个已解决 challenge")
-        threading.Thread(target=self._mine_loop, daemon=True).start()
-
-    def stop(self):
-        self.running = False
-        self._kill_workers()
-
-    def _kill_workers(self):
-        for p in self._processes:
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=2)
-        self._processes.clear()
-
-    def _fetch_mining_params(self):
-        """用 Multicall 一次 RPC 获取 challenge + target（原来要 2 次）"""
-        if self.multicall:
-            results = self.multicall.batch_call([
-                (self.contract, 'challengeNumber', ()),
-                (self.contract, 'miningTarget', ()),
-            ])
-            return results[0], results[1]
-        else:
-            challenge = self.contract.functions.challengeNumber().call()
-            target = self.contract.functions.miningTarget().call()
-            return challenge, target
-
-    def _mine_loop(self):
-        while self.running:
-            try:
-                challenge, target = self._fetch_mining_params()
-                challenge_hex = challenge.hex()
-
-                # ★ 优化: 检查本地缓存，已解决的 challenge 直接跳过
-                if _solved_cache.is_solved(challenge_hex):
-                    self.on_log(f"[缓存命中] Challenge {challenge_hex[:16]}... 已解决，跳过")
-                    time.sleep(1.0)  # ★ v2.4: 缩短等待, 更快检测新 challenge
-                    continue
-
-                target_bytes = target.to_bytes(32, 'big')
-                self.on_log(f"Challenge: {challenge_hex[:16]}... | Target: {target}")
-                self._retry_delay = 5
-                self._search_nonce_multiprocess(challenge, target_bytes)
-                if self.running:
-                    time.sleep(0.5)  # ★ v2.4: 缩短轮次间隔, 更快进入下一轮
-            except Exception as e:
-                self.on_log(f"[Error] {e}")
-                if self.running:
-                    self.on_log(f"[重试] {self._retry_delay}秒后重试...")
-                    time.sleep(self._retry_delay)
-                    self._retry_delay = min(self._retry_delay * 2, 60)
-
-    def _search_nonce_multiprocess(self, challenge, target_bytes):
-        """Launch N independent processes to search for nonce.
-        ★ v2.4: 步进式 nonce 分配 + 更频繁的 challenge 变更检测"""
-        prefix = challenge + bytes.fromhex(self.account.address[2:])
-
-        # ★ v2.4: 统一随机基础 nonce, 所有 worker 基于此步进, 保证零重叠
-        base_nonce = random.getrandbits(64)
-
-        # Shared memory for inter-process communication
-        stop_flag = multiprocessing.Value(ctypes.c_int, 0)
-        result_nonce = multiprocessing.Value(ctypes.c_uint64, 0)
-        result_digest = multiprocessing.Array(ctypes.c_ubyte, 32)
-        hashrate_array = multiprocessing.Array(ctypes.c_double, self.num_workers)
-        total_hashes_array = multiprocessing.Array(ctypes.c_uint64, self.num_workers)
-
-        self._processes = []
-        for wid in range(self.num_workers):
-            p = multiprocessing.Process(
-                target=_mining_worker,
-                args=(wid, prefix, target_bytes, self.num_workers,
-                      stop_flag, result_nonce, result_digest,
-                      hashrate_array, total_hashes_array, base_nonce),
-                daemon=True
-            )
-            self._processes.append(p)
-            p.start()
-
-        # Monitor loop: poll shared memory for hashrate updates & result
-        _last_log_time = time.monotonic()
-        _last_challenge_check = time.monotonic()
-        while self.running and not stop_flag.value:
-            time.sleep(0.5)  # ★ v2.4: 轮询间隔从 1s 缩短到 0.5s, 更快发现解
-            self.hashrate = sum(hashrate_array)
-            self.total_hashes = sum(total_hashes_array)
-            now = time.monotonic()
-
-            # 每 5 秒打印一次日志
-            if self.hashrate > 0 and (now - _last_log_time) >= 5.0:
-                hr = self.hashrate
-                if hr >= 1_000_000:
-                    hr_str = f"{hr / 1_000_000:.2f} MH/s"
-                elif hr >= 1_000:
-                    hr_str = f"{hr / 1_000:.2f} KH/s"
-                else:
-                    hr_str = f"{hr:.0f} H/s"
-                self.on_log(f"Hashrate: {hr_str} | Total: {self.total_hashes:,}")
-                _last_log_time = now
-
-            # ★ v2.4: challenge 检测间隔从 15 秒缩短到 8 秒, 更快发现被抢先
-            if (now - _last_challenge_check) >= 8.0:
-                _last_challenge_check = now
-                try:
-                    current_challenge = self.contract.functions.challengeNumber().call()
-                    if current_challenge != challenge:
-                        self.on_log("[检测到] Challenge 已被其他矿工解决，停止当前搜索")
-                        _solved_cache.mark_solved(challenge.hex())
-                        stop_flag.value = 1
-                        self._kill_workers()
-                        return
-                except Exception:
-                    pass  # 查询失败不影响挖矿
-
-        if not self.running:
-            stop_flag.value = 1
-            self._kill_workers()
-            return
-
-        # Wait for all processes to finish
-        for p in self._processes:
-            p.join(timeout=5)
-        self._processes.clear()
-
-        # Update final total
-        self.total_hashes = sum(total_hashes_array)
-
-        if stop_flag.value and self.running:
-            nonce = result_nonce.value
-            # Re-verify with web3 keccak for the on-chain digest
-            digest_web3 = Web3.keccak(prefix + nonce.to_bytes(32, 'big'))
-            self.on_log(f"[FOUND] Valid nonce: {nonce}")
-            self.on_found(nonce, digest_web3, challenge)
-
-
-# ─── Helper: load icon ──────────────────────────────────────────────────────
+# ─── Icon 加载 ───────────────────────────────────────────────────────────────
 
 def get_icon_path():
-    """Get path to icon file, handling PyInstaller bundle."""
     if getattr(sys, 'frozen', False):
         base = sys._MEIPASS
     else:
@@ -783,31 +1037,30 @@ def get_icon_path():
     return os.path.join(base, 'icon_circle.png')
 
 
-# ─── Main Application ───────────────────────────────────────────────────────
+# ─── GUI 主程序 ──────────────────────────────────────────────────────────────
 
 class SatoshiMinerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Satoshi Miner")
+        self.root.title("Satoshi Miner v3.0")
         self.root.geometry("980x780")
         self.root.minsize(880, 680)
         self.root.configure(bg=COLORS['bg'])
 
-        # State
         self.w3 = None
         self.contract = None
         self.account = None
-        self.engine = None
+        self.miner = None
         self.multicall = None
         self.mining = False
         self.history = []
-        self.cur_lang = 'en'
+        self.cur_lang = 'zh'
         self.i18n_widgets = []
         self.start_time = None
         self.logo_img = None
         self.logo_img_small = None
+        self.yaml_cfg = load_yaml_config()
 
-        # Set window icon
         try:
             ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico')
             if os.path.exists(ico_path):
@@ -820,8 +1073,6 @@ class SatoshiMinerApp:
         self._load_logo()
         self._build_ui()
 
-    # ── Logo ──
-
     def _load_logo(self):
         if not HAS_PIL:
             return
@@ -829,16 +1080,12 @@ class SatoshiMinerApp:
             icon_path = get_icon_path()
             if os.path.exists(icon_path):
                 img = Image.open(icon_path).convert("RGBA")
-                # Large logo for header
                 logo_large = img.resize((42, 42), Image.LANCZOS)
                 self.logo_img = ImageTk.PhotoImage(logo_large)
-                # Small logo
                 logo_small = img.resize((24, 24), Image.LANCZOS)
                 self.logo_img_small = ImageTk.PhotoImage(logo_small)
         except:
             pass
-
-    # ── i18n ──
 
     def t(self, key):
         return LANG[self.cur_lang].get(key, key)
@@ -865,24 +1112,18 @@ class SatoshiMinerApp:
         self.lang_btn.config(text='EN' if self.cur_lang == 'zh' else '中文')
         self._apply_lang()
 
-    # ── Config ──
-
     @staticmethod
     def _obfuscate_key(pk):
-        """简单混淆私钥存储（base64），防止明文直接暴露。"""
-        if not pk:
-            return ""
+        if not pk: return ""
         return base64.b64encode(pk.encode('utf-8')).decode('utf-8')
 
     @staticmethod
     def _deobfuscate_key(obf):
-        """还原混淆后的私钥"""
-        if not obf:
-            return ""
+        if not obf: return ""
         try:
             return base64.b64decode(obf.encode('utf-8')).decode('utf-8')
         except Exception:
-            return obf  # 兼容旧版明文
+            return obf
 
     def _load_config(self):
         self.config = {"rpc": DEFAULT_RPC, "gas_price": "0.1", "gas_limit": "200000",
@@ -899,7 +1140,6 @@ class SatoshiMinerApp:
         save_pk = self.save_pk_var.get() if hasattr(self, 'save_pk_var') else False
         if save_pk and hasattr(self, 'pk_var'):
             pk_to_save = self._obfuscate_key(self.pk_var.get().strip())
-
         to_save = {
             "rpc": self.rpc_var.get(),
             "gas_price": self.gas_price_var.get(),
@@ -923,8 +1163,6 @@ class SatoshiMinerApp:
         with open(HISTORY_FILE, "w") as f:
             json.dump(self.history[-200:], f, indent=2)
 
-    # ── Toast ──
-
     def _show_toast(self, msg, duration=3000):
         toast = tk.Frame(self.root, bg=COLORS['bg_card'], highlightbackground=COLORS['accent'],
                          highlightthickness=1)
@@ -937,98 +1175,67 @@ class SatoshiMinerApp:
     # ── Build UI ──
 
     def _build_ui(self):
-        # Main layout: sidebar + content
         self.main_container = tk.Frame(self.root, bg=COLORS['bg'])
         self.main_container.pack(fill='both', expand=True)
-
         self._build_sidebar()
         self._build_content_area()
         self._build_panels()
         self._show_panel('wallet')
 
     def _build_sidebar(self):
-        """Bitcoin wallet style left sidebar navigation."""
         self.sidebar = tk.Frame(self.main_container, bg=COLORS['bg_card'], width=220)
         self.sidebar.pack(side='left', fill='y')
         self.sidebar.pack_propagate(False)
 
-        # Logo area
         logo_frame = tk.Frame(self.sidebar, bg=COLORS['bg_card'], pady=20, padx=16)
         logo_frame.pack(fill='x')
-
         logo_row = tk.Frame(logo_frame, bg=COLORS['bg_card'])
         logo_row.pack(anchor='center')
-
         if self.logo_img:
-            logo_label = tk.Label(logo_row, image=self.logo_img, bg=COLORS['bg_card'])
-            logo_label.pack(side='left', padx=(0, 10))
-
+            tk.Label(logo_row, image=self.logo_img, bg=COLORS['bg_card']).pack(side='left', padx=(0, 10))
         title_col = tk.Frame(logo_row, bg=COLORS['bg_card'])
         title_col.pack(side='left')
-
-        title_lbl = tk.Label(title_col, text=self.t('title'),
-                              font=('Segoe UI', 14, 'bold'),
+        title_lbl = tk.Label(title_col, text=self.t('title'), font=('Segoe UI', 14, 'bold'),
                               fg=COLORS['white'], bg=COLORS['bg_card'])
         title_lbl.pack(anchor='w')
         self._register_i18n(title_lbl, 'title')
-
-        subtitle_lbl = tk.Label(title_col, text=self.t('subtitle'),
-                                 font=('Segoe UI', 8),
+        subtitle_lbl = tk.Label(title_col, text=self.t('subtitle'), font=('Segoe UI', 8),
                                  fg=COLORS['text3'], bg=COLORS['bg_card'])
         subtitle_lbl.pack(anchor='w')
         self._register_i18n(subtitle_lbl, 'subtitle')
 
-        # Separator
         tk.Frame(self.sidebar, bg=COLORS['border'], height=1).pack(fill='x', padx=16)
 
-        # Connection status indicator
         self.status_frame = tk.Frame(self.sidebar, bg=COLORS['bg_card'], padx=16, pady=12)
         self.status_frame.pack(fill='x')
-
         status_row = tk.Frame(self.status_frame, bg=COLORS['bg_card'])
         status_row.pack(fill='x')
-
         self.status_dot = tk.Canvas(status_row, width=10, height=10, bg=COLORS['bg_card'],
                                      highlightthickness=0)
         self.status_dot.pack(side='left', padx=(0, 8))
         self.status_dot.create_oval(1, 1, 9, 9, fill=COLORS['red_dim'], outline='')
-
         self.status_label = tk.Label(status_row, text=self.t('not_connected'),
-                                      font=('Segoe UI', 9), fg=COLORS['text2'],
-                                      bg=COLORS['bg_card'])
+                                      font=('Segoe UI', 9), fg=COLORS['text2'], bg=COLORS['bg_card'])
         self.status_label.pack(side='left')
 
-        # Separator
         tk.Frame(self.sidebar, bg=COLORS['border'], height=1).pack(fill='x', padx=16)
 
-        # Nav buttons
         nav_frame = tk.Frame(self.sidebar, bg=COLORS['bg_card'], pady=8)
         nav_frame.pack(fill='x')
-
         self.tab_buttons = {}
-        tabs = [
-            ('wallet', 'tab_wallet', '\u229a'),   # ⊚
-            ('mine', 'tab_mine', '\u26cf'),        # ⛏
-            ('history', 'tab_history', '\u2630'),   # ☰
-            ('settings', 'tab_settings', '\u2699'), # ⚙
-        ]
-
+        tabs = [('wallet', 'tab_wallet', '\u229a'), ('mine', 'tab_mine', '\u26cf'),
+                ('history', 'tab_history', '\u2630'), ('settings', 'tab_settings', '\u2699')]
         for tab_id, lang_key, icon in tabs:
             btn_frame = tk.Frame(nav_frame, bg=COLORS['bg_card'], cursor='hand2')
             btn_frame.pack(fill='x', padx=8, pady=1)
-
             icon_lbl = tk.Label(btn_frame, text=icon, font=('Segoe UI', 13),
                                 fg=COLORS['text3'], bg=COLORS['bg_card'], width=2)
             icon_lbl.pack(side='left', padx=(12, 6), pady=10)
-
             text_lbl = tk.Label(btn_frame, text=self.t(lang_key), font=('Segoe UI', 11),
                                 fg=COLORS['text2'], bg=COLORS['bg_card'], anchor='w')
             text_lbl.pack(side='left', fill='x', expand=True, pady=10)
             self._register_i18n(text_lbl, lang_key)
-
             self.tab_buttons[tab_id] = (btn_frame, icon_lbl, text_lbl)
-
-            # Click handlers
             for widget in (btn_frame, icon_lbl, text_lbl):
                 widget.bind('<Button-1>', lambda e, t=tab_id: self._show_panel(t))
                 widget.bind('<Enter>', lambda e, bf=btn_frame, il=icon_lbl, tl=text_lbl, t=tab_id:
@@ -1036,67 +1243,45 @@ class SatoshiMinerApp:
                 widget.bind('<Leave>', lambda e, bf=btn_frame, il=icon_lbl, tl=text_lbl, t=tab_id:
                             self._on_tab_hover(t, bf, il, tl, False))
 
-        # Bottom area: language toggle
         spacer = tk.Frame(self.sidebar, bg=COLORS['bg_card'])
         spacer.pack(fill='both', expand=True)
-
         tk.Frame(self.sidebar, bg=COLORS['border'], height=1).pack(fill='x', padx=16)
-
         bottom_frame = tk.Frame(self.sidebar, bg=COLORS['bg_card'], pady=12, padx=16)
         bottom_frame.pack(fill='x', side='bottom')
-
-        self.lang_btn = tk.Button(bottom_frame, text='中文', font=('Segoe UI', 9, 'bold'),
+        self.lang_btn = tk.Button(bottom_frame, text='EN', font=('Segoe UI', 9, 'bold'),
                                    bg=COLORS['bg_card2'], fg=COLORS['text2'],
                                    activebackground=COLORS['bg_hover'], activeforeground=COLORS['accent'],
                                    relief='flat', padx=12, pady=4, cursor='hand2', bd=0,
                                    command=self._toggle_lang)
         self.lang_btn.pack(side='left')
-
-        version_lbl = tk.Label(bottom_frame, text='v2.4.0', font=('Segoe UI', 8),
-                                fg=COLORS['text3'], bg=COLORS['bg_card'])
-        version_lbl.pack(side='right')
+        tk.Label(bottom_frame, text='v3.0', font=('Segoe UI', 8),
+                 fg=COLORS['text3'], bg=COLORS['bg_card']).pack(side='right')
 
     def _on_tab_hover(self, tab_id, btn_frame, icon_lbl, text_lbl, entering):
         if hasattr(self, '_active_tab') and self._active_tab == tab_id:
             return
-        if entering:
-            btn_frame.config(bg=COLORS['bg_hover'])
-            icon_lbl.config(bg=COLORS['bg_hover'])
-            text_lbl.config(bg=COLORS['bg_hover'])
-        else:
-            btn_frame.config(bg=COLORS['bg_card'])
-            icon_lbl.config(bg=COLORS['bg_card'])
-            text_lbl.config(bg=COLORS['bg_card'])
+        bg = COLORS['bg_hover'] if entering else COLORS['bg_card']
+        for w in (btn_frame, icon_lbl, text_lbl):
+            w.config(bg=bg)
 
     def _build_content_area(self):
         self.content_area = tk.Frame(self.main_container, bg=COLORS['bg'])
         self.content_area.pack(side='left', fill='both', expand=True)
-
-        # Top bar
         topbar = tk.Frame(self.content_area, bg=COLORS['bg'], pady=12, padx=24)
         topbar.pack(fill='x')
-
         self.page_title = tk.Label(topbar, text='', font=('Segoe UI', 18, 'bold'),
                                     fg=COLORS['white'], bg=COLORS['bg'])
         self.page_title.pack(side='left')
-
-        # Mining status badge (top right)
         self.mining_status_label = tk.Label(topbar, text=self.t('mining_idle'),
                                              font=('Segoe UI', 9, 'bold'),
-                                             fg=COLORS['text3'], bg=COLORS['bg_card2'],
-                                             padx=12, pady=4)
+                                             fg=COLORS['text3'], bg=COLORS['bg_card2'], padx=12, pady=4)
         self.mining_status_label.pack(side='right')
-
         tk.Frame(self.content_area, bg=COLORS['border'], height=1).pack(fill='x')
-
-        # Content frame
         self.content_frame = tk.Frame(self.content_area, bg=COLORS['bg'])
         self.content_frame.pack(fill='both', expand=True)
 
     def _show_panel(self, name):
         self._active_tab = name
-
-        # Update sidebar highlighting
         for tid, (bf, il, tl) in self.tab_buttons.items():
             if tid == name:
                 bf.config(bg=COLORS['bg_card2'])
@@ -1106,24 +1291,13 @@ class SatoshiMinerApp:
                 bf.config(bg=COLORS['bg_card'])
                 il.config(fg=COLORS['text3'], bg=COLORS['bg_card'])
                 tl.config(fg=COLORS['text2'], bg=COLORS['bg_card'], font=('Segoe UI', 11))
-
-        # Update page title
-        title_map = {
-            'wallet': 'tab_wallet',
-            'mine': 'tab_mine',
-            'history': 'tab_history',
-            'settings': 'tab_settings',
-        }
+        title_map = {'wallet': 'tab_wallet', 'mine': 'tab_mine',
+                     'history': 'tab_history', 'settings': 'tab_settings'}
         self.page_title.config(text=self.t(title_map.get(name, name)))
-
-        # Show panel
         for child in self.content_frame.winfo_children():
             child.pack_forget()
-
         if hasattr(self, 'panels') and name in self.panels:
             self.panels[name].pack(fill='both', expand=True)
-
-        # 切换到记录页面时，重新刷新历史列表
         if name == 'history':
             self._populate_history()
 
@@ -1134,195 +1308,148 @@ class SatoshiMinerApp:
         self._build_history_panel()
         self._build_settings_panel()
 
-    # ── Scrollable Canvas Helper ──
-
     def _make_scrollable_panel(self, parent_frame):
-        """创建一个可滚动的面板，返回 (canvas, content_frame)。
-        修复 bind_all 导致多面板滚动冲突 + 跨平台滚轮兼容。"""
         canvas = tk.Canvas(parent_frame, bg=COLORS['bg'], highlightthickness=0, bd=0)
         scrollbar = tk.Scrollbar(parent_frame, orient='vertical', command=canvas.yview,
                                   bg=COLORS['bg_card2'], troughcolor=COLORS['bg'])
         content = tk.Frame(canvas, bg=COLORS['bg'])
         content.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
         canvas_window = canvas.create_window((0, 0), window=content, anchor='nw')
-
         def _on_canvas_configure(event):
             canvas.itemconfig(canvas_window, width=event.width - 2)
         canvas.bind('<Configure>', _on_canvas_configure)
         canvas.configure(yscrollcommand=scrollbar.set)
-
-        # 跨平台滚轮绑定（仅当鼠标在此 canvas 上时生效）
         def _bind_wheel(event):
-            canvas.bind_all('<MouseWheel>', _on_mousewheel)
-            canvas.bind_all('<Button-4>', _on_mousewheel_linux)
-            canvas.bind_all('<Button-5>', _on_mousewheel_linux)
-
+            canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
         def _unbind_wheel(event):
             canvas.unbind_all('<MouseWheel>')
-            canvas.unbind_all('<Button-4>')
-            canvas.unbind_all('<Button-5>')
-
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def _on_mousewheel_linux(event):
-            if event.num == 4:
-                canvas.yview_scroll(-3, "units")
-            elif event.num == 5:
-                canvas.yview_scroll(3, "units")
-
         canvas.bind('<Enter>', _bind_wheel)
         canvas.bind('<Leave>', _unbind_wheel)
-
         scrollbar.pack(side='right', fill='y')
         canvas.pack(side='left', fill='both', expand=True)
-
         return canvas, content
+
+    def _make_card(self, parent):
+        return tk.Frame(parent, bg=COLORS['bg_card'], padx=20, pady=16,
+                         highlightbackground=COLORS['border'], highlightthickness=1)
+
+    def _make_separator(self, parent):
+        tk.Frame(parent, bg=COLORS['border'], height=1).pack(fill='x', pady=(10, 12))
+
+    def _make_entry(self, parent, **kwargs):
+        return tk.Entry(parent, bg=COLORS['bg_input'], fg=COLORS['text'],
+                          insertbackground=COLORS['accent'], relief='flat',
+                          font=('Consolas', 11), highlightthickness=1,
+                          highlightcolor=COLORS['accent'],
+                          highlightbackground=COLORS['border'], **kwargs)
+
+    def _make_accent_btn(self, parent, text='', command=None):
+        btn = tk.Button(parent, text=text, command=command,
+                         bg=COLORS['accent'], fg=COLORS['black'],
+                         activebackground=COLORS['accent_dark'], activeforeground=COLORS['black'],
+                         font=('Segoe UI', 12, 'bold'), relief='flat', cursor='hand2', bd=0)
+        btn.bind('<Enter>', lambda e: btn.config(bg=COLORS['accent_dark']))
+        btn.bind('<Leave>', lambda e: btn.config(bg=COLORS['accent']))
+        return btn
 
     # ── WALLET PANEL ──
 
     def _build_wallet_panel(self):
         panel = tk.Frame(self.content_frame, bg=COLORS['bg'])
         self.panels['wallet'] = panel
-
-        # Scrollable (fixed)
         canvas, content = self._make_scrollable_panel(panel)
-
         pad = {'padx': 24, 'pady': (0, 16)}
 
-        # ── Connection Card ──
+        # Connection Card
         conn_card = self._make_card(content)
         conn_card.pack(fill='x', padx=24, pady=(16, 16))
-
         conn_header = tk.Frame(conn_card, bg=COLORS['bg_card'])
         conn_header.pack(fill='x')
-        conn_icon = tk.Label(conn_header, text='\u26a1', font=('Segoe UI', 14),
-                              fg=COLORS['accent'], bg=COLORS['bg_card'])
-        conn_icon.pack(side='left', padx=(0, 8))
+        tk.Label(conn_header, text='\u26a1', font=('Segoe UI', 14),
+                 fg=COLORS['accent'], bg=COLORS['bg_card']).pack(side='left', padx=(0, 8))
         conn_title = tk.Label(conn_header, text=self.t('connection'),
-                               font=('Segoe UI', 13, 'bold'),
-                               fg=COLORS['white'], bg=COLORS['bg_card'])
+                               font=('Segoe UI', 13, 'bold'), fg=COLORS['white'], bg=COLORS['bg_card'])
         conn_title.pack(side='left')
         self._register_i18n(conn_title, 'connection')
-
         self._make_separator(conn_card)
 
-        # RPC
         rpc_lbl = tk.Label(conn_card, text=self.t('rpc_url'), font=('Segoe UI', 9, 'bold'),
                             fg=COLORS['text2'], bg=COLORS['bg_card'])
         rpc_lbl.pack(anchor='w', pady=(0, 4))
         self._register_i18n(rpc_lbl, 'rpc_url')
-
         self.rpc_var = tk.StringVar(value=self.config['rpc'])
-        rpc_entry = self._make_entry(conn_card, textvariable=self.rpc_var)
-        rpc_entry.pack(fill='x', pady=(0, 12), ipady=8)
+        self._make_entry(conn_card, textvariable=self.rpc_var).pack(fill='x', pady=(0, 12), ipady=8)
 
-        # Private Key
         pk_lbl = tk.Label(conn_card, text=self.t('private_key'), font=('Segoe UI', 9, 'bold'),
                            fg=COLORS['text2'], bg=COLORS['bg_card'])
         pk_lbl.pack(anchor='w', pady=(0, 4))
         self._register_i18n(pk_lbl, 'private_key')
-
         pk_row = tk.Frame(conn_card, bg=COLORS['bg_card'])
         pk_row.pack(fill='x', pady=(0, 16))
-
         self.pk_var = tk.StringVar()
-        # 自动填充上次保存的私钥
-        if self.config.get('save_private_key') and self.config.get('private_key_saved'):
-            restored_pk = self._deobfuscate_key(self.config['private_key_saved'])
-            self.pk_var.set(restored_pk)
+        # 优先从 yaml 配置读取私钥
+        yaml_pk = self.yaml_cfg.get("private_key", "")
+        if yaml_pk:
+            self.pk_var.set(yaml_pk)
+        elif self.config.get('save_private_key') and self.config.get('private_key_saved'):
+            self.pk_var.set(self._deobfuscate_key(self.config['private_key_saved']))
         self.pk_entry = self._make_entry(pk_row, textvariable=self.pk_var, show='*')
         self.pk_entry.pack(side='left', fill='x', expand=True, ipady=8)
-
         self.show_pk_var = tk.BooleanVar(value=False)
         show_btn = tk.Button(pk_row, text=self.t('show'), font=('Segoe UI', 9),
                               bg=COLORS['bg_card2'], fg=COLORS['text2'],
                               activebackground=COLORS['bg_hover'], relief='flat',
-                              padx=12, cursor='hand2', bd=0,
-                              command=self._toggle_pk)
+                              padx=12, cursor='hand2', bd=0, command=self._toggle_pk)
         show_btn.pack(side='left', padx=(8, 0), ipady=8)
-        self._register_i18n(show_btn, 'show')
 
-        # 保存私钥复选框
         save_pk_row = tk.Frame(conn_card, bg=COLORS['bg_card'])
         save_pk_row.pack(fill='x', pady=(0, 12))
-
         self.save_pk_var = tk.BooleanVar(value=self.config.get('save_private_key', False))
-        save_pk_cb = tk.Checkbutton(save_pk_row, text=self.t('save_pk'),
-                                      variable=self.save_pk_var,
-                                      font=('Segoe UI', 9), fg=COLORS['text2'],
-                                      bg=COLORS['bg_card'], selectcolor=COLORS['bg_input'],
-                                      activebackground=COLORS['bg_card'],
-                                      activeforeground=COLORS['text2'],
-                                      highlightthickness=0, bd=0, cursor='hand2')
-        save_pk_cb.pack(side='left')
-        self._register_i18n(save_pk_cb, 'save_pk')
+        tk.Checkbutton(save_pk_row, text=self.t('save_pk'), variable=self.save_pk_var,
+                        font=('Segoe UI', 9), fg=COLORS['text2'], bg=COLORS['bg_card'],
+                        selectcolor=COLORS['bg_input'], activebackground=COLORS['bg_card'],
+                        highlightthickness=0, bd=0, cursor='hand2').pack(side='left')
 
-        save_pk_tip = tk.Label(save_pk_row, text=self.t('save_pk_tip'),
-                                font=('Segoe UI', 8), fg=COLORS['text3'],
-                                bg=COLORS['bg_card'])
-        save_pk_tip.pack(side='left', padx=(4, 0))
-        self._register_i18n(save_pk_tip, 'save_pk_tip')
-
-        # Connect button
-        self.connect_btn = self._make_accent_btn(conn_card, text=self.t('connect'),
-                                                   command=self._connect)
+        self.connect_btn = self._make_accent_btn(conn_card, text=self.t('connect'), command=self._connect)
         self.connect_btn.pack(fill='x', ipady=6)
         self._register_i18n(self.connect_btn, 'connect')
 
-        # ── Balance Card (Bitcoin wallet style) ──
+        # Balance Card
         balance_card = self._make_card(content)
         balance_card.pack(fill='x', **pad)
-
         bal_header = tk.Frame(balance_card, bg=COLORS['bg_card'])
         bal_header.pack(fill='x')
-
         if self.logo_img_small:
             tk.Label(bal_header, image=self.logo_img_small, bg=COLORS['bg_card']).pack(side='left', padx=(0, 8))
-
         bal_title = tk.Label(bal_header, text=self.t('wallet_overview'),
-                              font=('Segoe UI', 13, 'bold'),
-                              fg=COLORS['white'], bg=COLORS['bg_card'])
+                              font=('Segoe UI', 13, 'bold'), fg=COLORS['white'], bg=COLORS['bg_card'])
         bal_title.pack(side='left')
         self._register_i18n(bal_title, 'wallet_overview')
-
         refresh_btn = tk.Button(bal_header, text=self.t('refresh'), font=('Segoe UI', 9),
                                  bg=COLORS['bg_card2'], fg=COLORS['text2'],
                                  activebackground=COLORS['bg_hover'], relief='flat',
-                                 padx=10, pady=2, cursor='hand2', bd=0,
-                                 command=self._refresh_info)
+                                 padx=10, pady=2, cursor='hand2', bd=0, command=self._refresh_info)
         refresh_btn.pack(side='right')
         self._register_i18n(refresh_btn, 'refresh')
-
         self._make_separator(balance_card)
 
-        # Main balance display (big number like Bitcoin wallet)
         self.main_balance_frame = tk.Frame(balance_card, bg=COLORS['bg_card'], pady=8)
         self.main_balance_frame.pack(fill='x')
-
-        sat_icon = tk.Label(self.main_balance_frame, text='₿', font=('Segoe UI', 28),
-                             fg=COLORS['accent'], bg=COLORS['bg_card'])
-        sat_icon.pack(side='left', padx=(0, 8))
-
+        tk.Label(self.main_balance_frame, text='₿', font=('Segoe UI', 28),
+                 fg=COLORS['accent'], bg=COLORS['bg_card']).pack(side='left', padx=(0, 8))
         bal_col = tk.Frame(self.main_balance_frame, bg=COLORS['bg_card'])
         bal_col.pack(side='left')
-
         self.big_balance_label = tk.Label(bal_col, text='0.00000000 SAT',
                                            font=('Segoe UI', 24, 'bold'),
                                            fg=COLORS['white'], bg=COLORS['bg_card'])
         self.big_balance_label.pack(anchor='w')
-
-        self.address_label = tk.Label(bal_col, text='--',
-                                       font=('Consolas', 10),
+        self.address_label = tk.Label(bal_col, text='--', font=('Consolas', 10),
                                        fg=COLORS['text3'], bg=COLORS['bg_card'])
         self.address_label.pack(anchor='w')
-
         self._make_separator(balance_card)
 
-        # Stats grid
         stats_frame = tk.Frame(balance_card, bg=COLORS['bg_card'])
         stats_frame.pack(fill='x')
-
         stat_defs = [
             ('bnb_balance', 'bnb_balance', COLORS['text']),
             ('sat_balance', 'sat_balance', COLORS['accent']),
@@ -1332,24 +1459,20 @@ class SatoshiMinerApp:
             ('epoch', 'epoch', COLORS['text']),
             ('era', 'era', COLORS['green']),
         ]
-
         self.stat_labels = {}
         for i, (sid, lang_key, color) in enumerate(stat_defs):
             r, c = divmod(i, 2)
             cell = tk.Frame(stats_frame, bg=COLORS['bg_card2'], padx=14, pady=10)
             cell.grid(row=r, column=c, padx=(0 if c == 0 else 4, 4 if c == 0 else 0),
                       pady=3, sticky='nsew')
-
             lbl = tk.Label(cell, text=self.t(lang_key).upper(), font=('Segoe UI', 8, 'bold'),
                            fg=COLORS['text3'], bg=COLORS['bg_card2'])
             lbl.pack(anchor='w')
             self._register_i18n(lbl, lang_key)
-
             val = tk.Label(cell, text='--', font=('Segoe UI', 13, 'bold'),
                            fg=color, bg=COLORS['bg_card2'])
             val.pack(anchor='w', pady=(2, 0))
             self.stat_labels[sid] = val
-
         stats_frame.columnconfigure(0, weight=1)
         stats_frame.columnconfigure(1, weight=1)
 
@@ -1358,83 +1481,63 @@ class SatoshiMinerApp:
     def _build_mine_panel(self):
         panel = tk.Frame(self.content_frame, bg=COLORS['bg'])
         self.panels['mine'] = panel
-
         canvas, content = self._make_scrollable_panel(panel)
 
-        # ── Mining Control Card ──
         ctrl_card = self._make_card(content)
         ctrl_card.pack(fill='x', padx=24, pady=(16, 16))
-
         ctrl_header = tk.Frame(ctrl_card, bg=COLORS['bg_card'])
         ctrl_header.pack(fill='x')
         tk.Label(ctrl_header, text='\u26cf', font=('Segoe UI', 14),
                  fg=COLORS['accent'], bg=COLORS['bg_card']).pack(side='left', padx=(0, 8))
         ctrl_title = tk.Label(ctrl_header, text=self.t('mining_dashboard'),
-                               font=('Segoe UI', 13, 'bold'),
-                               fg=COLORS['white'], bg=COLORS['bg_card'])
+                               font=('Segoe UI', 13, 'bold'), fg=COLORS['white'], bg=COLORS['bg_card'])
         ctrl_title.pack(side='left')
         self._register_i18n(ctrl_title, 'mining_dashboard')
-
         self._make_separator(ctrl_card)
 
-        # Big mine button
         self.mine_btn = tk.Button(ctrl_card, text=self.t('start_mining'),
                                    font=('Segoe UI', 14, 'bold'),
                                    bg=COLORS['accent'], fg=COLORS['black'],
                                    activebackground=COLORS['accent_dark'],
-                                   activeforeground=COLORS['black'],
                                    relief='flat', cursor='hand2', bd=0,
                                    command=self._toggle_mining)
         self.mine_btn.pack(fill='x', ipady=12)
-        self.mine_btn.bind('<Enter>', lambda e: self.mine_btn.config(
-            bg=COLORS['red'] if self.mining else COLORS['accent_dark']))
-        self.mine_btn.bind('<Leave>', lambda e: self.mine_btn.config(
-            bg=COLORS['red'] if self.mining else COLORS['accent']))
 
-        # Stats row (3 columns)
+        # Stats row
         stats_row = tk.Frame(ctrl_card, bg=COLORS['bg_card'])
         stats_row.pack(fill='x', pady=(16, 0))
-
-        for i, (key, default, color) in enumerate([
-            ('hashrate', '0 H/s', COLORS['green']),
-            ('blocks_found', '0', COLORS['accent']),
-            ('total_hashes', '0', COLORS['blue']),
-        ]):
-            cell = tk.Frame(stats_row, bg=COLORS['bg_card2'], padx=14, pady=10)
+        mining_stats = [
+            ('solver_mode', 'CPU', COLORS['blue']),
+            ('won_count', '0', COLORS['green']),
+            ('lost_count', '0', COLORS['red']),
+            ('sent_count', '0', COLORS['accent']),
+            ('win_rate', '0%', COLORS['purple']),
+        ]
+        self.mining_stat_labels = {}
+        for i, (key, default, color) in enumerate(mining_stats):
+            cell = tk.Frame(stats_row, bg=COLORS['bg_card2'], padx=10, pady=8)
             cell.pack(side='left', fill='x', expand=True,
-                      padx=(0 if i == 0 else 4, 4 if i < 2 else 0))
-
-            lbl = tk.Label(cell, text=self.t(key).upper(), font=('Segoe UI', 8, 'bold'),
+                      padx=(0 if i == 0 else 3, 3 if i < len(mining_stats)-1 else 0))
+            lbl = tk.Label(cell, text=self.t(key).upper(), font=('Segoe UI', 7, 'bold'),
                            fg=COLORS['text3'], bg=COLORS['bg_card2'])
             lbl.pack(anchor='w')
             self._register_i18n(lbl, key)
-
-            val_lbl = tk.Label(cell, text=default, font=('Segoe UI', 16, 'bold'),
+            val_lbl = tk.Label(cell, text=default, font=('Segoe UI', 13, 'bold'),
                                fg=color, bg=COLORS['bg_card2'])
             val_lbl.pack(anchor='w', pady=(2, 0))
+            self.mining_stat_labels[key] = val_lbl
 
-            if key == 'hashrate':
-                self.hashrate_label = val_lbl
-            elif key == 'blocks_found':
-                self.blocks_label = val_lbl
-            elif key == 'total_hashes':
-                self.total_hashes_label = val_lbl
-
-        # ── Mining Log Card ──
+        # Mining Log
         log_card = self._make_card(content)
         log_card.pack(fill='x', padx=24, pady=(0, 16))
-
         log_header = tk.Frame(log_card, bg=COLORS['bg_card'])
         log_header.pack(fill='x')
-
         tk.Label(log_header, text='\u2630', font=('Segoe UI', 13),
                  fg=COLORS['accent'], bg=COLORS['bg_card']).pack(side='left', padx=(0, 8))
         log_title = tk.Label(log_header, text=self.t('mining_log'),
-                              font=('Segoe UI', 13, 'bold'),
-                              fg=COLORS['white'], bg=COLORS['bg_card'])
+                              font=('Segoe UI', 13, 'bold'), fg=COLORS['white'], bg=COLORS['bg_card'])
         log_title.pack(side='left')
         self._register_i18n(log_title, 'mining_log')
-
         clear_btn = tk.Button(log_header, text=self.t('clear_log'), font=('Segoe UI', 9),
                                bg=COLORS['bg_card2'], fg=COLORS['text2'],
                                activebackground=COLORS['bg_hover'], relief='flat',
@@ -1442,15 +1545,12 @@ class SatoshiMinerApp:
                                command=lambda: self.log_text.delete('1.0', 'end'))
         clear_btn.pack(side='right')
         self._register_i18n(clear_btn, 'clear_log')
-
         self._make_separator(log_card)
-
         self.log_text = scrolledtext.ScrolledText(
             log_card, height=14, bg=COLORS['bg'], fg=COLORS['green'],
             font=('Consolas', 9), insertbackground=COLORS['green'],
             relief='flat', highlightthickness=1, bd=0,
-            highlightcolor=COLORS['border'], highlightbackground=COLORS['border']
-        )
+            highlightcolor=COLORS['border'], highlightbackground=COLORS['border'])
         self.log_text.pack(fill='both', expand=True)
 
     # ── HISTORY PANEL ──
@@ -1458,52 +1558,38 @@ class SatoshiMinerApp:
     def _build_history_panel(self):
         panel = tk.Frame(self.content_frame, bg=COLORS['bg'])
         self.panels['history'] = panel
-
-        # Header card
         header_card = self._make_card(panel)
         header_card.pack(fill='x', padx=24, pady=(16, 0))
-
         h_header = tk.Frame(header_card, bg=COLORS['bg_card'])
         h_header.pack(fill='x')
         tk.Label(h_header, text='\u2630', font=('Segoe UI', 14),
                  fg=COLORS['accent'], bg=COLORS['bg_card']).pack(side='left', padx=(0, 8))
         h_title = tk.Label(h_header, text=self.t('history_title'),
-                            font=('Segoe UI', 13, 'bold'),
-                            fg=COLORS['white'], bg=COLORS['bg_card'])
+                            font=('Segoe UI', 13, 'bold'), fg=COLORS['white'], bg=COLORS['bg_card'])
         h_title.pack(side='left')
         self._register_i18n(h_title, 'history_title')
 
-        # Column headers
         col_frame = tk.Frame(panel, bg=COLORS['bg_card2'], padx=24, pady=10)
         col_frame.pack(fill='x', padx=24, pady=(12, 2))
-
         cols = [('time', 16), ('nonce', 14), ('reward', 14), ('tx_hash', 22), ('status', 8)]
-        self.history_col_labels = []
         for key, w in cols:
             lbl = tk.Label(col_frame, text=self.t(key).upper(), font=('Segoe UI', 8, 'bold'),
                            fg=COLORS['accent'], bg=COLORS['bg_card2'], width=w, anchor='w')
             lbl.pack(side='left', padx=2)
-            self.history_col_labels.append((lbl, key))
             self._register_i18n(lbl, key)
 
-        # Scrollable history
         h_canvas = tk.Canvas(panel, bg=COLORS['bg'], highlightthickness=0, bd=0)
         h_scroll = tk.Scrollbar(panel, orient='vertical', command=h_canvas.yview,
                                  bg=COLORS['bg_card2'], troughcolor=COLORS['bg'])
         self.history_list_frame = tk.Frame(h_canvas, bg=COLORS['bg'])
-
         self.history_list_frame.bind('<Configure>',
                                       lambda e: h_canvas.configure(scrollregion=h_canvas.bbox('all')))
         h_canvas_window = h_canvas.create_window((0, 0), window=self.history_list_frame, anchor='nw')
         h_canvas.configure(yscrollcommand=h_scroll.set)
-
-        def _on_h_canvas_configure(event):
-            h_canvas.itemconfig(h_canvas_window, width=event.width)
-        h_canvas.bind('<Configure>', _on_h_canvas_configure)
-
+        def _on_h(event): h_canvas.itemconfig(h_canvas_window, width=event.width)
+        h_canvas.bind('<Configure>', _on_h)
         h_canvas.pack(side='left', fill='both', expand=True, padx=(24, 0), pady=(0, 16))
         h_scroll.pack(side='right', fill='y', padx=(0, 24), pady=(0, 16))
-
         self._populate_history()
 
     def _populate_history(self):
@@ -1511,8 +1597,7 @@ class SatoshiMinerApp:
             w.destroy()
         if not self.history:
             tk.Label(self.history_list_frame, text=self.t('no_records'),
-                     font=('Segoe UI', 11), fg=COLORS['text3'], bg=COLORS['bg'],
-                     pady=40).pack()
+                     font=('Segoe UI', 11), fg=COLORS['text3'], bg=COLORS['bg'], pady=40).pack()
             return
         for entry in reversed(self.history):
             self._add_history_row(entry, prepend=False)
@@ -1521,11 +1606,8 @@ class SatoshiMinerApp:
         bg = COLORS['bg_card']
         row = tk.Frame(self.history_list_frame, bg=bg, padx=24, pady=8)
         if prepend:
-            children = self.history_list_frame.winfo_children()
-            # Remove "no records" label if present
-            for c in children:
-                if isinstance(c, tk.Label):
-                    c.destroy()
+            for c in self.history_list_frame.winfo_children():
+                if isinstance(c, tk.Label): c.destroy()
             existing = self.history_list_frame.winfo_children()
             if existing:
                 row.pack(fill='x', pady=1, before=existing[0])
@@ -1533,15 +1615,14 @@ class SatoshiMinerApp:
                 row.pack(fill='x', pady=1)
         else:
             row.pack(fill='x', pady=1)
-
         status = entry.get('status', '')
         status_color = COLORS['green'] if status == 'Success' else COLORS['red']
-
         vals = [
             (entry.get('time', ''), 16, COLORS['text2']),
             (str(entry.get('nonce', ''))[:14], 14, COLORS['text']),
             (entry.get('reward', ''), 14, COLORS['accent']),
-            (entry.get('tx_hash', '')[:20] + '...' if len(entry.get('tx_hash', '')) > 20 else entry.get('tx_hash', ''), 22, COLORS['blue']),
+            ((entry.get('tx_hash', '')[:20] + '...' if len(entry.get('tx_hash', '')) > 20
+              else entry.get('tx_hash', '')), 22, COLORS['blue']),
             (status, 8, status_color),
         ]
         for text, w, fg in vals:
@@ -1553,151 +1634,61 @@ class SatoshiMinerApp:
     def _build_settings_panel(self):
         panel = tk.Frame(self.content_frame, bg=COLORS['bg'])
         self.panels['settings'] = panel
-
         canvas, content = self._make_scrollable_panel(panel)
 
-        # ── Gas Settings Card ──
         gas_card = self._make_card(content)
         gas_card.pack(fill='x', padx=24, pady=(16, 16))
-
         gas_header = tk.Frame(gas_card, bg=COLORS['bg_card'])
         gas_header.pack(fill='x')
         tk.Label(gas_header, text='\u2699', font=('Segoe UI', 14),
                  fg=COLORS['accent'], bg=COLORS['bg_card']).pack(side='left', padx=(0, 8))
         gas_title = tk.Label(gas_header, text=self.t('gas_settings'),
-                              font=('Segoe UI', 13, 'bold'),
-                              fg=COLORS['white'], bg=COLORS['bg_card'])
+                              font=('Segoe UI', 13, 'bold'), fg=COLORS['white'], bg=COLORS['bg_card'])
         gas_title.pack(side='left')
         self._register_i18n(gas_title, 'gas_settings')
-
         self._make_separator(gas_card)
 
-        # Gas Price
         gp_lbl = tk.Label(gas_card, text=self.t('gas_price'), font=('Segoe UI', 9, 'bold'),
                            fg=COLORS['text2'], bg=COLORS['bg_card'])
         gp_lbl.pack(anchor='w', pady=(0, 4))
         self._register_i18n(gp_lbl, 'gas_price')
+        self.gas_price_var = tk.StringVar(value=self.config.get('gas_price', '0.05'))
+        self._make_entry(gas_card, textvariable=self.gas_price_var).pack(fill='x', pady=(0, 12), ipady=8)
 
-        self.gas_price_var = tk.StringVar(value=self.config.get('gas_price', '5'))
-        gp_entry = self._make_entry(gas_card, textvariable=self.gas_price_var)
-        gp_entry.pack(fill='x', pady=(0, 12), ipady=8)
-
-        # Gas Limit
         gl_lbl = tk.Label(gas_card, text=self.t('gas_limit'), font=('Segoe UI', 9, 'bold'),
                            fg=COLORS['text2'], bg=COLORS['bg_card'])
         gl_lbl.pack(anchor='w', pady=(0, 4))
         self._register_i18n(gl_lbl, 'gas_limit')
-
         self.gas_limit_var = tk.StringVar(value=self.config.get('gas_limit', '200000'))
-        gl_entry = self._make_entry(gas_card, textvariable=self.gas_limit_var)
-        gl_entry.pack(fill='x', pady=(0, 12), ipady=8)
+        self._make_entry(gas_card, textvariable=self.gas_limit_var).pack(fill='x', pady=(0, 12), ipady=8)
 
-        # Contract
         ct_lbl = tk.Label(gas_card, text=self.t('contract'), font=('Segoe UI', 9, 'bold'),
                            fg=COLORS['text2'], bg=COLORS['bg_card'])
         ct_lbl.pack(anchor='w', pady=(0, 4))
         self._register_i18n(ct_lbl, 'contract')
-
-        ct_val = tk.Label(gas_card, text=CONTRACT_ADDRESS, font=('Consolas', 10),
-                           fg=COLORS['accent'], bg=COLORS['bg_card'])
-        ct_val.pack(anchor='w', pady=(0, 16))
-
-        # Save
-        save_btn = self._make_accent_btn(gas_card, text=self.t('save_settings'),
-                                          command=self._save_config)
+        tk.Label(gas_card, text=CONTRACT_ADDRESS, font=('Consolas', 10),
+                 fg=COLORS['accent'], bg=COLORS['bg_card']).pack(anchor='w', pady=(0, 16))
+        save_btn = self._make_accent_btn(gas_card, text=self.t('save_settings'), command=self._save_config)
         save_btn.pack(fill='x', ipady=6)
         self._register_i18n(save_btn, 'save_settings')
 
-        # ── Contract Info Card ──
-        info_card = self._make_card(content)
-        info_card.pack(fill='x', padx=24, pady=(0, 16))
-
-        info_header = tk.Frame(info_card, bg=COLORS['bg_card'])
-        info_header.pack(fill='x')
-        tk.Label(info_header, text='₿', font=('Segoe UI', 14),
-                 fg=COLORS['accent'], bg=COLORS['bg_card']).pack(side='left', padx=(0, 8))
-        info_title = tk.Label(info_header, text=self.t('contract_info'),
-                               font=('Segoe UI', 13, 'bold'),
-                               fg=COLORS['white'], bg=COLORS['bg_card'])
-        info_title.pack(side='left')
-        self._register_i18n(info_title, 'contract_info')
-
-        self._make_separator(info_card)
-
-        info_items = [
-            ('network', 'BSC Mainnet'),
-            ('max_supply', '21,000,000 SAT'),
-            ('halving', self.t('every_era')),
-        ]
-        for key, val in info_items:
-            row = tk.Frame(info_card, bg=COLORS['bg_card'], pady=6)
-            row.pack(fill='x')
-            lbl = tk.Label(row, text=self.t(key), font=('Segoe UI', 10, 'bold'),
-                           fg=COLORS['text2'], bg=COLORS['bg_card'])
-            lbl.pack(side='left')
-            self._register_i18n(lbl, key)
-            tk.Label(row, text=val, font=('Segoe UI', 10, 'bold'),
-                     fg=COLORS['white'], bg=COLORS['bg_card']).pack(side='right')
-
-        # ── About Card ──
+        # About
         about_card = self._make_card(content)
         about_card.pack(fill='x', padx=24, pady=(0, 24))
-
         about_header = tk.Frame(about_card, bg=COLORS['bg_card'])
         about_header.pack(fill='x')
         tk.Label(about_header, text='\u2139', font=('Segoe UI', 14),
                  fg=COLORS['accent'], bg=COLORS['bg_card']).pack(side='left', padx=(0, 8))
         about_title = tk.Label(about_header, text=self.t('about'),
-                                font=('Segoe UI', 13, 'bold'),
-                                fg=COLORS['white'], bg=COLORS['bg_card'])
+                                font=('Segoe UI', 13, 'bold'), fg=COLORS['white'], bg=COLORS['bg_card'])
         about_title.pack(side='left')
         self._register_i18n(about_title, 'about')
-
         self._make_separator(about_card)
-
-        self.about_label = tk.Label(about_card, text=self.t('about_text'),
-                                     font=('Segoe UI', 10), fg=COLORS['text2'],
-                                     bg=COLORS['bg_card'], justify='left', wraplength=550)
-        self.about_label.pack(anchor='w', fill='x')
-        self._register_i18n(self.about_label, 'about_text')
-
-        # Dynamic wraplength for about text (with guard to prevent infinite loop)
-        self._about_last_width = 0
-        def _update_about_wrap(event):
-            new_w = max(200, event.width - 60)
-            if abs(new_w - self._about_last_width) > 10:
-                self._about_last_width = new_w
-                self.about_label.config(wraplength=new_w)
-        about_card.bind('<Configure>', _update_about_wrap)
-
-    # ── Shared widget builders ──
-
-    def _make_card(self, parent):
-        card = tk.Frame(parent, bg=COLORS['bg_card'], padx=20, pady=16,
-                         highlightbackground=COLORS['border'], highlightthickness=1)
-        return card
-
-    def _make_separator(self, parent):
-        tk.Frame(parent, bg=COLORS['border'], height=1).pack(fill='x', pady=(10, 12))
-
-    def _make_entry(self, parent, **kwargs):
-        entry = tk.Entry(parent, bg=COLORS['bg_input'], fg=COLORS['text'],
-                          insertbackground=COLORS['accent'], relief='flat',
-                          font=('Consolas', 11), highlightthickness=1,
-                          highlightcolor=COLORS['accent'],
-                          highlightbackground=COLORS['border'], **kwargs)
-        return entry
-
-    def _make_accent_btn(self, parent, text='', command=None):
-        btn = tk.Button(parent, text=text, command=command,
-                         bg=COLORS['accent'], fg=COLORS['black'],
-                         activebackground=COLORS['accent_dark'],
-                         activeforeground=COLORS['black'],
-                         font=('Segoe UI', 12, 'bold'), relief='flat',
-                         cursor='hand2', bd=0)
-        btn.bind('<Enter>', lambda e: btn.config(bg=COLORS['accent_dark']))
-        btn.bind('<Leave>', lambda e: btn.config(bg=COLORS['accent']))
-        return btn
+        about_label = tk.Label(about_card, text=self.t('about_text'),
+                                 font=('Segoe UI', 10), fg=COLORS['text2'],
+                                 bg=COLORS['bg_card'], justify='left', wraplength=550)
+        about_label.pack(anchor='w', fill='x')
+        self._register_i18n(about_label, 'about_text')
 
     # ── Actions ──
 
@@ -1725,13 +1716,10 @@ class SatoshiMinerApp:
     def _connect(self):
         rpc = self.rpc_var.get().strip()
         pk = self.pk_var.get().strip()
-
         if not pk:
             messagebox.showerror(self.t('error'), self.t('enter_pk'))
             return
-
         try:
-            # ★ v2.4: 多 RPC 自动测速选优
             if not rpc or rpc == DEFAULT_RPC:
                 self._log("多 RPC 测速中...")
                 best_rpc, best_lat = select_best_rpc(DEFAULT_RPC_LIST, on_log=self._log)
@@ -1741,9 +1729,8 @@ class SatoshiMinerApp:
                     self._log(f"选中最快节点: {rpc} ({best_lat:.0f}ms)")
                 else:
                     rpc = DEFAULT_RPC
-                    self._log(f"所有节点测速失败, 使用默认: {rpc}")
 
-            self.w3 = Web3(create_optimized_provider(rpc, _rpc_rate_limiter))
+            self.w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
             if not self.w3.is_connected():
                 raise Exception("Cannot connect to RPC")
 
@@ -1751,27 +1738,17 @@ class SatoshiMinerApp:
             self.contract = self.w3.eth.contract(
                 address=Web3.to_checksum_address(CONTRACT_ADDRESS), abi=CONTRACT_ABI)
 
-            # 初始化 Multicall3 批量调用
             try:
                 self.multicall = Multicall(self.w3)
-                self._log("Multicall3 已启用（RPC 调用量降低 60%+）")
-            except Exception as mc_err:
+                self._log("Multicall3 已启用")
+            except Exception:
                 self.multicall = None
-                self._log(f"[警告] Multicall3 不可用，使用单次调用模式: {mc_err}")
 
-            chain_id = self.w3.eth.chain_id
-
-            # ★ v2.4: 显示网络 gas 价格
-            net_gas = get_network_gas_price(self.w3)
-            gas_str = f"{net_gas:.3f} Gwei" if net_gas else "未知"
-            self._log(f"Connected to chain {chain_id} via {rpc}")
-            self._log(f"当前网络 Gas: {gas_str}")
-            self._log(f"Wallet: {self.account.address}")
+            self._log(f"已连接  钱包: {self.account.address}")
             self._update_status_display()
             self._show_toast(self.t('connected'))
             self._save_config()
             self._refresh_info()
-
         except Exception as e:
             messagebox.showerror(self.t('error'), f"{self.t('conn_failed')}: {e}")
             self._log(f"[Error] {e}")
@@ -1779,7 +1756,6 @@ class SatoshiMinerApp:
     def _refresh_info(self):
         if not self.w3 or not self.account:
             return
-        # 防抖：至少 5 秒刷新一次，避免频繁调用 RPC
         now = time.monotonic()
         if hasattr(self, '_last_refresh_time') and (now - self._last_refresh_time) < 5.0:
             return
@@ -1789,10 +1765,8 @@ class SatoshiMinerApp:
     def _do_refresh(self):
         try:
             addr = self.account.address
-            bnb = self.w3.eth.get_balance(addr)  # 1 次 RPC（非合约调用，无法合并进 multicall）
-
+            bnb = self.w3.eth.get_balance(addr)
             if self.multicall:
-                # 6 个合约调用合并成 1 次 RPC（原来 6 次）
                 results = self.multicall.batch_call([
                     (self.contract, 'balanceOf', (addr,)),
                     (self.contract, 'getMiningDifficulty', ()),
@@ -1801,12 +1775,7 @@ class SatoshiMinerApp:
                     (self.contract, 'tokensMinted', ()),
                     (self.contract, 'rewardEra', ()),
                 ])
-                sat = results[0]
-                difficulty = results[1]
-                reward = results[2]
-                epoch = results[3]
-                minted = results[4]
-                era = results[5]
+                sat, difficulty, reward, epoch, minted, era = results
             else:
                 sat = self.contract.functions.balanceOf(addr).call()
                 difficulty = self.contract.functions.getMiningDifficulty().call()
@@ -1825,11 +1794,9 @@ class SatoshiMinerApp:
                 self.stat_labels['difficulty'].config(text=f"{difficulty:,}")
                 self.stat_labels['epoch'].config(text=f"{epoch:,}")
                 self.stat_labels['era'].config(text=f"{era}")
-
             self.root.after(0, _update)
-            self._log("Wallet info refreshed")
         except Exception as e:
-            self._log(f"[Error] Refresh: {e}")
+            self._log(f"[Error] 刷新: {e}")
 
     def _toggle_mining(self):
         if self.mining:
@@ -1841,190 +1808,81 @@ class SatoshiMinerApp:
         if not self.w3 or not self.account:
             messagebox.showerror(self.t('error'), self.t('connect_first'))
             return
-
         self.mining = True
         self.start_time = time.time()
         self.mine_btn.config(text=self.t('stop_mining'), bg=COLORS['red'])
         self.mining_status_label.config(text=self.t('mining_active'), fg=COLORS['green'])
         self._log(self.t('mining_started'))
 
-        self.engine = MiningEngine(self.w3, self.contract, self.account,
-                                    on_log=self._log, on_found=self._on_nonce_found,
-                                    multicall=self.multicall)
-        self.engine.start()
-        # 从历史记录恢复已出块计数
-        blocks = len([h for h in self.history if h.get('status') == 'Success'])
-        self.blocks_label.config(text=str(blocks))
-        self._update_hashrate()
+        # 构建反应式挖矿配置
+        cfg = dict(self.yaml_cfg)
+        pk = self.pk_var.get().strip()
+        cfg["_pk"] = pk if pk.startswith("0x") else "0x" + pk
+        cfg["private_key"] = pk
+        cfg["gas_limit"] = int(self.gas_limit_var.get())
 
-    def _stop_mining(self):
-        self.mining = False
-        if self.engine:
-            self.engine.stop()
-            self.engine = None
-        self.mine_btn.config(text=self.t('start_mining'), bg=COLORS['accent'])
-        self.mining_status_label.config(text=self.t('mining_idle'), fg=COLORS['text3'])
-        self._log(self.t('mining_stopped'))
+        def on_log(msg, lv="INFO"):
+            self._log(msg)
 
-    def _update_hashrate(self):
-        if self.mining and self.engine:
-            self.hashrate_label.config(text=f"{self.engine.hashrate:.0f} H/s")
-            self.total_hashes_label.config(text=f"{self.engine.total_hashes:,}")
-            self.root.after(2000, self._update_hashrate)
-
-    def _on_nonce_found(self, nonce, digest, challenge):
-        self._log(f"Submitting nonce={nonce}")
-        threading.Thread(target=self._submit_solution, args=(nonce, digest, challenge), daemon=True).start()
-
-    def _pre_validate_solution(self, nonce, digest, challenge):
-        """提交前预判：用 Multicall 把 3 个检查合并为 1 次 RPC（原来 4 次）。
-        返回 (通过, 原因) 元组。"""
-        try:
-            if self.multicall:
-                # 一次 RPC 同时查 challengeNumber + solutionForChallenge + miningTarget
-                results = self.multicall.batch_call([
-                    (self.contract, 'challengeNumber', ()),
-                    (self.contract, 'solutionForChallenge', (challenge,)),
-                    (self.contract, 'miningTarget', ()),
-                ])
-                current_challenge = results[0]
-                solution = results[1]
-                current_target = results[2]
-            else:
-                current_challenge = self.contract.functions.challengeNumber().call()
-                solution = self.contract.functions.solutionForChallenge(challenge).call()
-                current_target = self.contract.functions.miningTarget().call()
-
-            # 检查1: 链上 challengeNumber 是否和挖矿时一致
-            if current_challenge != challenge:
-                return False, "Challenge 已更新（被其他矿工抢先）"
-
-            # 检查2: 该 challenge 是否已被解决
-            if solution != b'\x00' * 32:
-                return False, "该 Challenge 已被解决"
-
-            # 检查3: digest 是否仍然满足当前 target
-            if int.from_bytes(digest, 'big') > current_target:
-                return False, "Digest 超过当前 target（难度已调整）"
-
-            # 检查4: 用 eth_call 模拟执行 mint，捕获 revert（单独 1 次 RPC，无法合并）
-            self.contract.functions.mint(nonce, digest).call({
-                'from': self.account.address
-            })
-
-            return True, "预验证通过"
-        except Exception as e:
-            error_msg = str(e)
-            if "already solved" in error_msg.lower():
-                return False, "Challenge 已被其他矿工解决"
-            elif "exceeds" in error_msg.lower() or "target" in error_msg.lower():
-                return False, "Digest 不满足当前难度要求"
-            elif "invalid" in error_msg.lower():
-                return False, "无效的 challenge digest"
-            else:
-                return False, f"模拟执行失败: {error_msg}"
-
-    def _submit_solution(self, nonce, digest, challenge):
-        try:
-            # ── 第一次预判：提交前验证，避免浪费 gas ──
-            valid, reason = self._pre_validate_solution(nonce, digest, challenge)
-            if not valid:
-                self._log(f"[跳过提交] {reason}，节省 gas 费")
-                # ★ 标记该 challenge 为已解决，下次不再挖
-                _solved_cache.mark_solved(challenge.hex())
-                entry = {
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "nonce": str(nonce), "reward": "0",
-                    "tx_hash": "N/A (预判跳过)", "status": "Skipped"
-                }
-                self.history.append(entry)
-                self._save_history()
-                self.root.after(0, lambda: self._add_history_row(entry))
-                return
-            self._log("[预判通过] 构建交易中...")
-
-            addr = self.account.address
-            # ★ v2.4: 优先使用网络实时 gas (跟随网络最低价, 最省钱)
-            net_gas = get_network_gas_price(self.w3)
-            if net_gas is not None:
-                # 网络 gas x1.05 安全边际, 但不低于 0.01 Gwei, 不高于用户设置的上限
-                user_max = float(self.gas_price_var.get())
-                effective_gas = max(0.01, min(net_gas * 1.05, user_max))
-                self._log(f"Gas: 网络 {net_gas:.3f} -> 使用 {effective_gas:.3f} Gwei")
-            else:
-                effective_gas = float(self.gas_price_var.get())
-                self._log(f"Gas: 网络不可查, 使用设置值 {effective_gas} Gwei")
-            gas_price = self.w3.to_wei(effective_gas, 'gwei')
-            gas_limit = int(self.gas_limit_var.get())
-            nonce_tx = self.w3.eth.get_transaction_count(addr)
-
-            tx = self.contract.functions.mint(nonce, digest).build_transaction({
-                'from': addr, 'gas': gas_limit, 'gasPrice': gas_price,
-                'nonce': nonce_tx, 'chainId': self.w3.eth.chain_id
-            })
-
-            signed = self.w3.eth.account.sign_transaction(tx, self.account.key)
-
-            # ── 第二次预判：签名后、发送前再验证一次 ──
-            # 这里是关键：第一次预判到签名之间有时间差，
-            # 在这段时间内其他矿工可能抢先提交了同一个 challenge
-            valid2, reason2 = self._pre_validate_solution(nonce, digest, challenge)
-            if not valid2:
-                self._log(f"[发送前拦截] {reason2}，交易未发送，节省 gas 费")
-                _solved_cache.mark_solved(challenge.hex())
-                entry = {
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "nonce": str(nonce), "reward": "0",
-                    "tx_hash": "N/A (发送前拦截)", "status": "Skipped"
-                }
-                self.history.append(entry)
-                self._save_history()
-                self.root.after(0, lambda: self._add_history_row(entry))
-                return
-            self._log("[二次验证通过] 发送交易...")
-
-            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            tx_hex = tx_hash.hex()
-            self._log(f"TX sent: {tx_hex}")
-
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            status = "Success" if receipt['status'] == 1 else "Failed"
-            reward = self.contract.functions.getMiningReward().call()
-            self._log(f"TX {status}: {tx_hex}")
-
-            # ★ 无论成功失败，都标记该 challenge 已解决
-            _solved_cache.mark_solved(challenge.hex())
-
+        def on_win(epoch):
             entry = {
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "nonce": str(nonce), "reward": f"{reward / 1e8:.8f} SAT",
-                "tx_hash": tx_hex, "status": status
+                "nonce": "", "reward": "50 SAT",
+                "tx_hash": f"epoch={epoch}", "status": "Success"
             }
             self.history.append(entry)
             self._save_history()
-
-            def _ui():
-                self._add_history_row(entry)
-                blocks = len([h for h in self.history if h.get('status') == 'Success'])
-                self.blocks_label.config(text=str(blocks))
-            self.root.after(0, _ui)
+            self.root.after(0, lambda: self._add_history_row(entry))
             self._refresh_info()
 
-        except Exception as e:
-            self._log(f"[Error] Submit: {e}")
+        def on_lose():
             entry = {
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "nonce": str(nonce), "reward": "0", "tx_hash": "N/A", "status": "Error"
+                "nonce": "", "reward": "0",
+                "tx_hash": "被抢先 revert", "status": "Failed"
             }
             self.history.append(entry)
             self._save_history()
             self.root.after(0, lambda: self._add_history_row(entry))
 
+        def on_stats(s):
+            def _upd():
+                self.mining_stat_labels['solver_mode'].config(text=s.get('mode', 'CPU'))
+                self.mining_stat_labels['won_count'].config(text=str(s.get('won', 0)))
+                self.mining_stat_labels['lost_count'].config(text=str(s.get('lost', 0)))
+                self.mining_stat_labels['sent_count'].config(text=str(s.get('sent', 0)))
+                self.mining_stat_labels['win_rate'].config(text=f"{s.get('win_rate', 0):.0f}%")
+            self.root.after(0, _upd)
 
-# ─── Main ────────────────────────────────────────────────────────────────────
+        try:
+            self.miner = ReactiveMiner(cfg, on_log=on_log, on_win=on_win,
+                                        on_lose=on_lose, on_stats=on_stats)
+            self.miner.start()
+            self._log(f"反应式挖矿引擎启动  求解器: {self.miner.mode.upper()}  "
+                      f"难度: {self.miner.difficulty}  "
+                      f"Gas: {Web3.from_wei(self.miner.gas_wei, 'gwei')} Gwei")
+            if self.miner.dry:
+                self._log("*** DRY_RUN 模式: 只算解+计时, 不广播不花 gas ***")
+        except Exception as e:
+            self._log(f"[Error] 启动失败: {e}")
+            self.mining = False
+            self.mine_btn.config(text=self.t('start_mining'), bg=COLORS['accent'])
+            self.mining_status_label.config(text=self.t('mining_idle'), fg=COLORS['text3'])
+
+    def _stop_mining(self):
+        self.mining = False
+        if self.miner:
+            self.miner.stop()
+            self.miner = None
+        self.mine_btn.config(text=self.t('start_mining'), bg=COLORS['accent'])
+        self.mining_status_label.config(text=self.t('mining_idle'), fg=COLORS['text3'])
+        self._log(self.t('mining_stopped'))
+
+
+# ─── 主入口 ──────────────────────────────────────────────────────────────────
 
 def main():
-    multiprocessing.freeze_support()  # Required for PyInstaller on Windows
+    multiprocessing.freeze_support()
     root = tk.Tk()
     try:
         from ctypes import windll
@@ -2033,6 +1891,7 @@ def main():
         pass
     app = SatoshiMinerApp(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()

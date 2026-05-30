@@ -6,3 +6,7 @@ pyinstaller>=6.0.0
 requests>=2.28.0
 setuptools>=65.0.0
 pyyaml>=6.0
+websockets>=11.0
+numpy>=1.24
+# GPU 可选: 有 NVIDIA 显卡时装, 没有就跳过 (CPU 模式照常工作)
+# pyopencl>=2023.1

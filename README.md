@@ -1,107 +1,65 @@
-# Satoshi (SAT) Miner - BSC PoW Mining Client
+# Satoshi Miner v3.0 — 反应式挖矿版
 
-A desktop GUI application for mining the Satoshi (SAT) Proof-of-Work ERC20 token on BSC.
+整合了测试安装包的**全部挖矿规则**，带 GUI 桌面界面，支持一键编译为 Windows .exe 安装包。
 
-## Contract Info
-- **Contract**: `0x14Dc4b4929c664534f1d4D64107d8F36CbF906a0`
-- **Network**: BSC (Binance Smart Chain)
-- **Total Supply**: 21,000,000 SAT
-- **Decimals**: 8
-- **Mining Reward**: 50 SAT (halves each era)
+## 核心挖矿规则 (全部来自测试安装包)
 
----
+| 规则 | 说明 |
+|------|------|
+| **WebSocket Mint 事件订阅** | 零轮询检测新挑战号，对手一 mint 进块，推送瞬间拿到下一轮挑战号 |
+| **CPU 常驻热池** | 多进程常驻预热，挑战号一变立刻切换，零冷启动 |
+| **GPU OpenCL 求解器** | 高难度时 GPU 比 CPU 快得多，支持占用率控制 (温控) |
+| **多 Relay 并行广播** | 同一签名交易并行发往 bloXroute / 48 Club 等直投验证者 |
+| **Gas 跟网络地板价** | 不加价，与对手一致，省钱 |
+| **自动 detect 模式** | 先试 logs-WS，连续失败自动退到 heads 模式 |
+| **过期解自动丢弃** | 挑战号被新的取代时，旧解不发，省 gas |
+| **DRY_RUN 试运行** | 只算解+计时不广播不花 gas，安全观察 |
+| **离线签名+本地 nonce** | 无 RPC 往返，签名后直接广播 |
+| **难度/gas 自动刷新** | 后台周期刷新 target/难度/gas，nonce 防漂移 |
 
-## How to Build the .exe on Windows
+## 文件清单
 
-### Prerequisites
-- **Python 3.10+** installed and added to PATH
-  - Download: https://www.python.org/downloads/
-  - During installation, check "Add Python to PATH"
+| 文件 | 作用 |
+|------|------|
+| `satoshi_miner.py` | 主程序 (GUI + 反应式挖矿引擎) |
+| `gpu_miner.py` | GPU OpenCL 内核 (被主程序调用) |
+| `config.yaml` | 配置文件 (**记得填私钥**) |
+| `keccak_pow.c` + `setup.py` | C 加速扩展源码 |
+| `requirements.txt` | Python 依赖清单 |
+| `build.bat` | **一键编译 .exe** |
+| `icon.ico` / `icon_circle.png` | 图标 |
 
-### Steps
-1. Download and extract this folder to your Windows PC
-2. Double-click `build.bat`
-3. Wait for the build to complete
-4. Find `SatoshiMiner.exe` in the `dist/` folder
-5. Copy `SatoshiMiner.exe` to any location and run it
+## 编译 Windows .exe 安装包
 
-### Manual Build (if .bat doesn't work)
-```
-pip install -r requirements.txt
-pyinstaller --noconfirm --onefile --windowed --name "SatoshiMiner" --collect-all web3 --collect-all eth_abi --collect-all eth_account --hidden-import eth_hash.auto --hidden-import eth_hash.backends.pycryptodome --hidden-import cytoolz satoshi_miner.py
-```
+### 前置条件
+- Windows 10/11
+- Python 3.10+ (64位)，安装时勾选 "Add Python to PATH"
+- (可选) NVIDIA 显卡驱动 (GPU 模式需要)
+- (可选) Visual Studio Build Tools (C 加速扩展需要)
 
----
+### 一键编译
 
-## C 扩展加速安装指南 (重要! 提速 5-10 倍)
+**双击 `build.bat`** 即可，它会自动：
+1. 安装所有 Python 依赖
+2. 编译 C 加速扩展 (失败不影响，自动退回 Python 模式)
+3. 用 PyInstaller 打包为单个 `SatoshiMiner.exe`
 
-### 快速诊断
-双击 `diagnose.bat`，查看你的环境状态和当前算力。
+编译完成后，`dist\SatoshiMiner.exe` 就是最终的安装包文件。
 
-### 安装步骤
+### 使用方法
+1. 双击 `SatoshiMiner.exe` 直接运行
+2. 在界面填写私钥，点击"连接钱包"
+3. 切换到"挖矿"页，点击"开始挖矿"
+4. 可以把 `SatoshiMiner.exe` 发给别人，直接安装直接使用
 
-**第一步：安装 Visual Studio Build Tools (C 编译器)**
+### 高级配置 (可选)
 
-Windows 默认没有 C 编译器，需要装一个：
-
-方法 A - 命令行安装 (推荐)：
-1. 右键开始菜单 → "Windows Terminal (管理员)" 或 "PowerShell (管理员)"
-2. 运行：`winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`
-3. 等待安装完成 (约 2-5GB 下载)
-4. **重启电脑**
-
-方法 B - 手动安装：
-1. 打开 https://visualstudio.microsoft.com/visual-cpp-build-tools/
-2. 下载 "Build Tools for Visual Studio 2022"
-3. 安装时勾选 **"使用 C++ 的桌面开发"**
-4. **重启电脑**
-
-**第二步：编译 C 扩展**
-双击 `install_c_extension.bat`，等待编译完成。
-
-**第三步：验证**
-双击 `diagnose.bat`，看到以下内容说明成功：
-```
-[3] keccak_pow C 扩展:
-    [OK] C 扩展已加载 - 挖矿将使用 5-10 倍加速
-```
-
-### 常见问题
-
-**Q: install_c_extension.bat 说找不到编译器？**
-A: 从开始菜单找到 "x64 Native Tools Command Prompt for VS 2022"，在那个窗口里 cd 到矿机目录再运行脚本。
-
-**Q: 装了 Build Tools 但还是不行？**
-A: 重启电脑后重试。
-
-**Q: 不想装 Build Tools 怎么办？**
-A: 矿机仍然可以用，只是会用 pycryptodome 的 Python 版本，速度慢 5-10 倍。
-
----
-
-## How to Use
-
-1. **Launch** `SatoshiMiner.exe` (or run `python satoshi_miner.py`)
-2. **Enter RPC URL** - Default is BSC mainnet. You can change to any BSC RPC:
-   - `https://bsc-dataseed1.binance.org`
-   - `https://bsc-dataseed2.binance.org`
-   - `https://bsc-dataseed3.binance.org`
-   - `https://bsc-dataseed4.binance.org`
-   - Or your own private node
-3. **Enter Private Key** - Your BSC wallet private key (needed to sign mint transactions)
-4. Click **Connect**
-5. Click **Start Mining**
-
-### Features
-- Real-time hashrate display
-- BNB and SAT balance display
-- Mining difficulty and reward info
-- Mining history with TX hashes
-- Configurable gas price and gas limit
-- Auto-submit solutions to the blockchain
-
-### Important Notes
-- You need some BNB in your wallet to pay for gas fees when submitting mining solutions
-- Mining is CPU-based (keccak256 hashing)
-- Your private key is never saved to disk
-- The gas price default is 5 Gwei (standard for BSC)
+编辑 `config.yaml` 可调整：
+- `solver`: `cpu` 或 `gpu` (默认 cpu)
+- `gpu_util`: GPU 占用率 1-100 (默认 100)
+- `gpu_batch_size`: GPU 每批 nonce 数 (3070 建议 8M-32M)
+- `relay_urls`: 自定义 relay 节点
+- `ws_urls`: 自定义 WebSocket 节点
+- `detect_mode`: `auto` / `logs` / `heads`
+- `dry_run`: `true` 试运行不花 gas
+- `verbose_logs`: `true` 打印全部细节
